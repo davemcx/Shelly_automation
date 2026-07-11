@@ -1,0 +1,63 @@
+// ============================================================
+// Shelly 2PM - Script de conmutación alterna
+// Los interruptores alternan su estado cada 1 segundo durante 12 segundos
+// Interruptor 0: inicia ENCENDIDO, Interruptor 1: inicia APAGADO
+// Al llegar a TOTAL_TICKS, ambos interruptores se apagan y el temporizador se detiene
+// ============================================================
+
+var TOTAL_TICKS = 20;    // Número total de intervalos
+var INTERVAL_MS = 500;  // Duración del intervalo en milisegundos
+var tick        = 0;     // Contador de ticks actual
+var timerId     = null;  // Referencia al temporizador
+
+// Aplica el estado correspondiente a un tick dado
+function applyState(t) {
+  var sw0 = (t % 2 === 0);
+  var sw1 = !sw0;
+
+  Shelly.call("Switch.Set", { id: 0, on: sw0 }, function (result, error_code, error_message) {
+    if (error_code !== 0) {
+      print("Error al ajustar Switch 0: " + error_message);
+    }
+  });
+
+  Shelly.call("Switch.Set", { id: 1, on: sw1 }, function (result, error_code, error_message) {
+    if (error_code !== 0) {
+      print("Error al ajustar Switch 1: " + error_message);
+    }
+  });
+
+  print("Tick " + t + " | Switch 0: " + sw0 + " | Switch 1: " + sw1);
+}
+
+// Detiene el temporizador y apaga ambos interruptores
+function shutdown() {
+  if (timerId !== null) {
+    Timer.clear(timerId);
+    timerId = null; // Evita referencias a un temporizador ya eliminado
+  }
+
+  Shelly.call("Switch.Set", { id: 0, on: false });
+  Shelly.call("Switch.Set", { id: 1, on: false });
+
+  print("Secuencia completa. Ambos interruptores APAGADOS.");
+}
+
+// Evita ejecuciones duplicadas si el script se reinicia mientras el timer sigue activo
+if (timerId !== null) {
+  Timer.clear(timerId);
+  timerId = null;
+}
+
+// Aplica el estado inicial (tick 0 → SW0=ON, SW1=OFF)
+applyState(tick);
+
+// Inicia el temporizador repetitivo
+timerId = Timer.set(INTERVAL_MS, true, function () {
+  tick++;
+  applyState(tick);
+
+  if (tick >= TOTAL_TICKS) {
+    shutdown();
+  }
+});

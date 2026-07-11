@@ -1,0 +1,171 @@
+// ── Configuración ────────────────────────────────────────────
+var SWITCH_ID          = 0;
+var INITIAL_ON_MIN     = 58;
+var INITIAL_OFF_MIN    = 2;
+var STEP_MIN           = 4;   // Cada ciclo: ON pierde 4 min, OFF gana 4 min
+var MAX_RETRIES        = 2;
+var MAX_RUNTIME_MIN    = 9 * 60; // Límite total: 9 horas
+
+// ── Estado ───────────────────────────────────────────────────
+var onMin       = INITIAL_ON_MIN;
+var offMin      = INITIAL_OFF_MIN;
+var cycleCount  = 0;
+var currentTimer = null;
+var maxRuntimeTimer = null;
+var isRunning   = false;
+var isTerminating = false;
+
+// ── Utilidades ───────────────────────────────────────────────
+function log(level, msg) {
+  print("[" + level + "] " + msg);
+}
+
+function clearActiveTimer() {
+  if (currentTimer !== null) {
+    Timer.clear(currentTimer);
+    currentTimer = null;
+  }
+}
+
+function clearMaxRuntimeTimer() {
+  if (maxRuntimeTimer !== null) {
+    Timer.clear(maxRuntimeTimer);
+    maxRuntimeTimer = null;
+  }
+}
+
+// ── Terminación ──────────────────────────────────────────────
+function terminateScript(reason) {
+  if (isTerminating) return;
+  isTerminating = true;
+  isRunning = false;
+
+  log("INFO", "Terminando script: " + reason);
+  clearActiveTimer();
+  clearMaxRuntimeTimer();
+
+  Shelly.call("Switch.Set", { id: SWITCH_ID, on: false },
+    function(res, code, msg) {
+      if (code !== 0) {
+        log("WARN", "No se pudo apagar el switch al terminar: " + msg);
+      } else {
+        log("INFO", "Switch apagado al terminar.");
+      }
+      die("Ciclo completado: " + reason);
+    }
+  );
+}
+
+// ── Condición de parada ──────────────────────────────────────
+function shouldStop() {
+  if (onMin <= 0) {
+    log("INFO", "Ciclos completados. ON=" + onMin + " min — fin del programa.");
+    return true;
+  }
+  if (offMin > INITIAL_ON_MIN) {
+    log("WARN", "OFF=" + offMin + " min excede el límite. Abortando.");
+    return true;
+  }
+  return false;
+}
+
+// ── Switch con reintento ──────────────────────────────────────
+function switchSet(state, retriesLeft, onSuccess, onFail) {
+  Shelly.call("Switch.Set", { id: SWITCH_ID, on: state },
+    function(res, code, msg) {
+      if (code === 0) {
+        onSuccess();
+      } else if (retriesLeft > 0) {
+        log("WARN", "Error al " + (state ? "encender" : "apagar") +
+            " (reintento " + (MAX_RETRIES - retriesLeft + 1) + "): " + msg);
+        // Pequeña pausa antes de reintentar
+        Timer.set(500, false, function() {
+          switchSet(state, retriesLeft - 1, onSuccess, onFail);
+        });
+      } else {
+        log("ERROR", "Fallo definitivo al " + (state ? "encender" : "apagar") + ": " + msg);
+        onFail();
+      }
+    }
+  );
+}
+
+// ── Ciclo principal ────────────────────────────────────────────
+function runCycle() {
+  if (isRunning || isTerminating) return;
+
+  // Calcular tiempos para este ciclo según cuántos ya pasaron
+  onMin  = INITIAL_ON_MIN  - (cycleCount * STEP_MIN);
+  offMin = INITIAL_OFF_MIN + (cycleCount * STEP_MIN);
+
+  if (shouldStop()) {
+    terminateScript("condición de parada alcanzada");
+    return;
+  }
+
+  isRunning = true;
+  cycleCount++;
+
+  log("INFO", "=== CICLO " + cycleCount +
+      " | ON=" + onMin + "min OFF=" + offMin + "min ===");
+
+  // 1. Encender
+  switchSet(true, MAX_RETRIES,
+    function() {
+      log("INFO", "Switch encendido. Esperando " + onMin + " min...");
+
+      currentTimer = Timer.set(onMin * 60 * 1000, false, function() {
+        currentTimer = null;
+
+        // 2. Apagar
+        switchSet(false, MAX_RETRIES,
+          function() {
+            log("INFO", "Switch apagado. Esperando " + offMin + " min...");
+
+            currentTimer = Timer.set(offMin * 60 * 1000, false, function() {
+              currentTimer = null;
+              isRunning = false;
+              log("INFO", "Pausa completada. Iniciando siguiente ciclo.");
+              runCycle();
+            });
+          },
+          function() { terminateScript("fallo al apagar"); }
+        );
+      });
+    },
+    function() { terminateScript("fallo al encender"); }
+  );
+}
+
+// ── Límite de tiempo total ────────────────────────────────────
+function startMaxRuntimeGuard() {
+  maxRuntimeTimer = Timer.set(MAX_RUNTIME_MIN * 60 * 1000, false, function() {
+    maxRuntimeTimer = null;
+    log("WARN", "Límite de " + (MAX_RUNTIME_MIN / 60) + " horas alcanzado.");
+    terminateScript("tiempo máximo de ejecución (" + (MAX_RUNTIME_MIN / 60) + "h) alcanzado");
+  });
+}
+
+// ── Limpieza al detener externamente ─────────────────────────
+Shelly.addEventHandler(function(event) {
+  if (event.component === "script" && event.event === "stopped") {
+    clearActiveTimer();
+    clearMaxRuntimeTimer();
+    log("INFO", "Script detenido externamente. Timers limpiados.");
+  }
+});
+
+// ── Arranque ─────────────────────────────────────────────────
+Shelly.call("Switch.GetStatus", { id: SWITCH_ID },
+  function(res, code, msg) {
+    if (code !== 0) {
+      log("ERROR", "Switch ID " + SWITCH_ID + " no accesible: " + msg);
+      die("Fallo en arranque");
+      return;
+    }
+    log("INFO", "=== INICIANDO PROGRAMA DE CICLOS ===");
+    log("INFO", "Estado inicial del switch: " + (res.output ? "ON" : "OFF"));
+    startMaxRuntimeGuard();
+    runCycle();
+  }
+);

@@ -1,22 +1,22 @@
 // ================================================================
-//  Dynamic Duty Cycle Switch Controller
-//  - ON time decreases linearly each cycle
-//  - OFF time increases linearly each cycle
-//  - Full safety, retry, and graceful-stop support
+//  Controlador de Ciclo de Trabajo Dinámico
+//  - El tiempo ON disminuye linealmente cada ciclo
+//  - El tiempo OFF aumenta linealmente cada ciclo
+//  - Incluye seguridad, reintentos y parada segura
 // ================================================================
 
 // ---------------------------------------------------------------
-// 1. CONFIGURATION
+// 1. CONFIGURACIÓN
 // ---------------------------------------------------------------
-var SWITCH_ID       = 0;    // Relay channel to control
-var INITIAL_ON_MIN  = 30;   // Starting ON duration (minutes)
-var INITIAL_OFF_MIN = 1;    // Starting OFF duration (minutes)
-var STEP_MIN        = 1;    // Linear step per cycle (minutes)
-var MAX_RETRIES     = 2;    // RPC retry attempts before abort
-var MAX_RUNTIME_MIN = 540;  // Hard safety ceiling (9 hours)
+var SWITCH_ID       = 0;    // Canal del relé a controlar
+var INITIAL_ON_MIN  = 30;   // Duración ON inicial (minutos)
+var INITIAL_OFF_MIN = 1;    // Duración OFF inicial (minutos)
+var STEP_MIN        = 1;    // Paso lineal por ciclo (minutos)
+var MAX_RETRIES     = 2;    // Reintentos RPC antes de abortar
+var MAX_RUNTIME_MIN = 540;  // Techo de seguridad (9 horas)
 
 // ---------------------------------------------------------------
-// STATE VARIABLES
+// VARIABLES DE ESTADO
 // ---------------------------------------------------------------
 var onMin           = INITIAL_ON_MIN;
 var offMin          = INITIAL_OFF_MIN;
@@ -27,63 +27,57 @@ var isRunning       = false;
 var isTerminating   = false;
 
 // ================================================================
-// 2. LOGGING UTILITY
+// 2. UTILIDAD DE LOG
 // ================================================================
 function log(level, msg) {
   print("[" + level + "] DutyCycle: " + msg);
 }
 
 // ================================================================
-// 3. GRACEFUL TERMINATION
+// 3. TERMINACIÓN SEGURA
 // ================================================================
 function terminateScript(reason) {
-  // Guard against re-entrant or duplicate calls
   if (isTerminating) {
-    log("WARN", "terminateScript already in progress, ignoring re-entry.");
+    log("WARN", "terminateScript ya en curso, ignorando reentrada.");
     return;
   }
   isTerminating = true;
 
-  log("INFO", "--- Terminating --- Reason: " + reason);
+  log("INFO", "--- Terminando --- Motivo: " + reason);
 
-  // Clear the cycle timer (ON or OFF phase)
   if (currentTimer !== null) {
     Timer.clear(currentTimer);
     currentTimer = null;
-    log("INFO", "Cycle timer cleared.");
+    log("INFO", "Timer de ciclo cancelado.");
   }
 
-  // Clear the global safety timer
   if (maxRuntimeTimer !== null) {
     Timer.clear(maxRuntimeTimer);
     maxRuntimeTimer = null;
-    log("INFO", "Safety timer cleared.");
+    log("INFO", "Timer de seguridad cancelado.");
   }
 
-  // Final safety measure: guarantee the switch ends in OFF state
-  log("INFO", "Issuing final Switch OFF before exit...");
+  // Medida final: garantizar que el switch quede en OFF
+  log("INFO", "Enviando apagado final antes de salir...");
   Shelly.call(
     "Switch.Set",
     { id: SWITCH_ID, on: false },
     function(res, err_code, err_msg) {
       if (err_code !== 0) {
-        log("WARN", "Final Switch OFF failed (code=" + err_code + "): " + err_msg);
+        log("WARN", "Apagado final falló (code=" + err_code + "): " + err_msg);
       } else {
-        log("INFO", "Switch confirmed OFF. Safe to exit.");
+        log("INFO", "Switch confirmado OFF. Seguro para salir.");
       }
-      die(); // Halt the script engine
+      die(); // Detiene el motor del script
     }
   );
 }
 
 // ================================================================
-// 4. RPC RETRY WRAPPER
+// 4. WRAPPER DE REINTENTOS RPC
 // ================================================================
-//
-//  callWithRetry(state, retriesLeft, onSuccess, onFailure)
-//
-//  Attempts Switch.Set up to (1 + MAX_RETRIES) times total.
-//  A 500 ms back-off delay is inserted between each retry.
+//  Intenta Switch.Set hasta (1 + MAX_RETRIES) veces en total,
+//  con 500 ms de espera entre cada reintento.
 // ================================================================
 function callWithRetry(state, retriesLeft, onSuccess, onFailure) {
   if (isTerminating) return;
@@ -96,25 +90,23 @@ function callWithRetry(state, retriesLeft, onSuccess, onFailure) {
     function(res, err_code, err_msg) {
 
       if (err_code === 0) {
-        log("INFO", "Switch.Set -> " + label + " succeeded.");
+        log("INFO", "Switch.Set -> " + label + " exitoso.");
         onSuccess();
         return;
       }
 
-      // RPC returned a non-zero status
       log("WARN",
-        "Switch.Set -> " + label + " failed " +
+        "Switch.Set -> " + label + " falló " +
         "(code=" + err_code + ", msg=" + err_msg + "). " +
-        "Retries left: " + retriesLeft
+        "Reintentos restantes: " + retriesLeft
       );
 
       if (retriesLeft > 0) {
-        // Back-off 500 ms then retry
         Timer.set(500, false, function() {
           callWithRetry(state, retriesLeft - 1, onSuccess, onFailure);
         });
       } else {
-        log("ERROR", "Switch.Set -> " + label + " exhausted all retries.");
+        log("ERROR", "Switch.Set -> " + label + " agotó todos los reintentos.");
         onFailure();
       }
     }
@@ -122,134 +114,117 @@ function callWithRetry(state, retriesLeft, onSuccess, onFailure) {
 }
 
 // ================================================================
-// 5. CORE CYCLE LOGIC
+// 5. LÓGICA PRINCIPAL DEL CICLO
 // ================================================================
-//
-//  Sequence per cycle:
-//    [Calculate times]
-//    -> Switch ON  -> wait onMin  minutes
-//    -> Switch OFF -> wait offMin minutes
-//    -> cycleCount++ -> runCycle() (next iteration)
+//  Secuencia por ciclo:
+//    [Calcular tiempos]
+//    -> Switch ON  -> esperar onMin  minutos
+//    -> Switch OFF -> esperar offMin minutos
+//    -> cycleCount++ -> runCycle() (siguiente iteración)
 // ================================================================
 function runCycle() {
   if (isTerminating) return;
 
   if (isRunning) {
-    log("WARN", "runCycle invoked while already running — skipping duplicate call.");
+    log("WARN", "runCycle invocado mientras ya corría — se omite llamada duplicada.");
     return;
   }
 
-  // --- Recalculate times for this iteration ---
+  // --- Recalcular tiempos para esta iteración ---
   onMin  = INITIAL_ON_MIN  - (cycleCount * STEP_MIN);
   offMin = INITIAL_OFF_MIN + (cycleCount * STEP_MIN);
 
   log("INFO",
-    "=== Cycle " + cycleCount +
+    "=== Ciclo " + cycleCount +
     " | ON=" + onMin + " min" +
     " | OFF=" + offMin + " min ==="
   );
 
-  // --- Stop Conditions ---
+  // --- Condiciones de parada ---
   if (onMin <= 0) {
-    terminateScript(
-      "onMin reached " + onMin + " (<= 0) at cycle " + cycleCount
-    );
+    terminateScript("onMin llegó a " + onMin + " (<= 0) en el ciclo " + cycleCount);
     return;
   }
   if (offMin > INITIAL_ON_MIN) {
     terminateScript(
-      "offMin (" + offMin + ") exceeded INITIAL_ON_MIN (" +
-      INITIAL_ON_MIN + ") at cycle " + cycleCount
+      "offMin (" + offMin + ") superó INITIAL_ON_MIN (" +
+      INITIAL_ON_MIN + ") en el ciclo " + cycleCount
     );
     return;
   }
 
   isRunning = true;
 
-  // ---- STEP 1: Turn Switch ON ----
+  // ---- PASO 1: Encender switch ----
   callWithRetry(
     true,
     MAX_RETRIES,
-
-    // onSuccess for Switch ON
     function() {
       if (isTerminating) return;
 
-      log("INFO", "Phase ON  started. Duration: " + onMin + " min.");
+      log("INFO", "Fase ON iniciada. Duración: " + onMin + " min.");
 
       currentTimer = Timer.set(
-        onMin * 60 * 1000,  // ms
-        false,              // one-shot
+        onMin * 60 * 1000,
+        false,
         function() {
           currentTimer = null;
           if (isTerminating) return;
 
-          // ---- STEP 2: Turn Switch OFF ----
+          // ---- PASO 2: Apagar switch ----
           callWithRetry(
             false,
             MAX_RETRIES,
-
-            // onSuccess for Switch OFF
             function() {
               if (isTerminating) return;
 
-              log("INFO", "Phase OFF started. Duration: " + offMin + " min.");
+              log("INFO", "Fase OFF iniciada. Duración: " + offMin + " min.");
 
               currentTimer = Timer.set(
-                offMin * 60 * 1000,  // ms
-                false,               // one-shot
+                offMin * 60 * 1000,
+                false,
                 function() {
                   currentTimer = null;
                   if (isTerminating) return;
 
-                  // ---- STEP 3: Advance and recurse ----
-                  log("INFO", "Cycle " + cycleCount + " completed.");
+                  // ---- PASO 3: Avanzar y recursar ----
+                  log("INFO", "Ciclo " + cycleCount + " completado.");
                   cycleCount++;
                   isRunning = false;
-                  runCycle();          // tail-recursive entry for next cycle
+                  runCycle();
                 }
               );
             },
-
-            // onFailure for Switch OFF
             function() {
-              terminateScript(
-                "Switch OFF RPC failed after all retries on cycle " + cycleCount
-              );
+              terminateScript("RPC Switch OFF falló tras todos los reintentos en el ciclo " + cycleCount);
             }
           );
         }
       );
     },
-
-    // onFailure for Switch ON
     function() {
-      terminateScript(
-        "Switch ON RPC failed after all retries on cycle " + cycleCount
-      );
+      terminateScript("RPC Switch ON falló tras todos los reintentos en el ciclo " + cycleCount);
     }
   );
 }
 
 // ================================================================
-// 6. EXTERNAL STOP EVENT HANDLER
+// 6. MANEJADOR DE EVENTO DE PARADA EXTERNA
 // ================================================================
-//
-//  Catches device-level "script stopped" events so that any
-//  pending timer callbacks do not fire after the script has been
-//  halted externally (e.g., via the app or RPC).
+//  Captura eventos de "script detenido" a nivel de dispositivo para
+//  que ningún timer pendiente dispare después de una parada externa
+//  (ej. desde la app o vía RPC).
 // ================================================================
 Shelly.addEventHandler(function(event) {
   if (!event) return;
 
-  // The component field is "script:N" for script events
   var isScriptEvent = (
     typeof event.component === "string" &&
     event.component.indexOf("script") === 0
   );
 
   if (isScriptEvent && event.event === "stopped") {
-    log("INFO", "External 'stopped' event received. Clearing all timers.");
+    log("INFO", "Evento externo 'stopped' recibido. Cancelando todos los timers.");
 
     if (currentTimer !== null) {
       Timer.clear(currentTimer);
@@ -263,9 +238,9 @@ Shelly.addEventHandler(function(event) {
 });
 
 // ================================================================
-// 7. INITIALIZATION
+// 7. INICIALIZACIÓN
 // ================================================================
-log("INFO", "Booting Dynamic Duty Cycle Controller...");
+log("INFO", "Iniciando Controlador de Ciclo de Trabajo Dinámico...");
 log("INFO",
   "Config -> " +
   "SWITCH_ID="       + SWITCH_ID       + " | " +
@@ -276,7 +251,7 @@ log("INFO",
   "MAX_RUNTIME="     + MAX_RUNTIME_MIN + " min"
 );
 
-// Verify the relay is present and responsive before doing anything
+// Verificar que el relé responda antes de hacer nada
 Shelly.call(
   "Switch.GetStatus",
   { id: SWITCH_ID },
@@ -284,33 +259,31 @@ Shelly.call(
 
     if (err_code !== 0) {
       log("ERROR",
-        "Switch.GetStatus failed (code=" + err_code + "): " + err_msg +
-        ". Cannot proceed — aborting."
+        "Switch.GetStatus falló (code=" + err_code + "): " + err_msg +
+        ". No se puede continuar — abortando."
       );
       die();
       return;
     }
 
     log("INFO",
-      "Switch " + SWITCH_ID + " is responsive. " +
-      "Current output: " + (res.output ? "ON" : "OFF")
+      "Switch " + SWITCH_ID + " responde correctamente. " +
+      "Estado actual: " + (res.output ? "ON" : "OFF")
     );
 
-    // --- Start the global safety / watchdog timer ---
+    // --- Iniciar el timer de seguridad global (watchdog) ---
     maxRuntimeTimer = Timer.set(
-      MAX_RUNTIME_MIN * 60 * 1000,  // ms
-      false,                         // one-shot
+      MAX_RUNTIME_MIN * 60 * 1000,
+      false,
       function() {
         maxRuntimeTimer = null;
-        terminateScript(
-          "MAX_RUNTIME_MIN ceiling reached (" + MAX_RUNTIME_MIN + " min)"
-        );
+        terminateScript("Se alcanzó el techo MAX_RUNTIME_MIN (" + MAX_RUNTIME_MIN + " min)");
       }
     );
 
-    log("INFO", "Safety watchdog armed for " + MAX_RUNTIME_MIN + " min.");
+    log("INFO", "Watchdog de seguridad armado por " + MAX_RUNTIME_MIN + " min.");
 
-    // --- Kick off the first duty cycle ---
+    // --- Iniciar el primer ciclo de trabajo ---
     runCycle();
   }
 );

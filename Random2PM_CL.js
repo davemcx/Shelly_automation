@@ -1,24 +1,24 @@
 // ============================================================
-//  Shelly 2PM — Alternating Switch Sequence with Overlap
-//  Runs ONLY between 21:05 and 23:00 (device local time)
+//  Shelly 2PM — Secuencia alternada de switches con solapamiento
+//  Corre SOLO entre 21:05 y 23:00 (hora local del dispositivo)
 // ============================================================
 
-var INTERVALS   = [2, 4, 6, 8, 9, 11, 13, 15]; // minutes
+var INTERVALS    = [2, 4, 6, 8, 9, 11, 13, 15]; // minutos
 var TIME_START_H = 21, TIME_START_M = 5;
 var TIME_END_H   = 23, TIME_END_M   = 0;
 
-// ---- Runtime state ----
-var intervals    = [];   // shuffled copy of INTERVALS
-var step         = 0;    // current step index
-var curSw        = -1;   // active switch (0 or 1)
+// ---- Estado en tiempo de ejecución ----
+var intervals    = [];   // copia mezclada de INTERVALS
+var step         = 0;    // índice del paso actual
+var curSw        = -1;   // switch activo (0 o 1)
 var overlapTimer = -1;
 var mainTimer    = -1;
 
 // ============================================================
-//  Helpers
+//  Funciones auxiliares
 // ============================================================
 
-// Build a printable array string without JSON.stringify
+// Convierte un array a string imprimible (sin JSON.stringify)
 function arrToStr(arr) {
   var s = "[";
   for (var i = 0; i < arr.length; i++) {
@@ -28,7 +28,7 @@ function arrToStr(arr) {
   return s + "]";
 }
 
-// In-place Fisher-Yates shuffle (no .sort() needed)
+// Fisher-Yates in-place (sin necesidad de .sort())
 function shuffle(arr) {
   var i, j, tmp;
   for (i = arr.length - 1; i > 0; i--) {
@@ -39,21 +39,21 @@ function shuffle(arr) {
   }
 }
 
-// Alternate between 0 and 1
+// Alterna entre 0 y 1
 function otherSw(sw) {
   return (sw === 1) ? 0 : 1;
 }
 
-// Zero-pad a number to 2 digits for display
+// Rellena con cero a la izquierda para mostrar 2 dígitos
 function pad2(n) {
   return (n < 10) ? "0" + n : "" + n;
 }
 
 // ============================================================
-//  Cleanup — cancel all timers and turn off both switches
+//  Limpieza — cancela timers y apaga ambos switches
 // ============================================================
 function cleanup() {
-  print("[CLEANUP] Cancelling timers and switching both outputs OFF.");
+  print("[LIMPIEZA] Cancelando timers y apagando ambas salidas.");
   if (overlapTimer !== -1) { Timer.clear(overlapTimer); overlapTimer = -1; }
   if (mainTimer    !== -1) { Timer.clear(mainTimer);    mainTimer    = -1; }
   Shelly.call("Switch.Set", {id: 0, on: false}, null);
@@ -61,68 +61,60 @@ function cleanup() {
 }
 
 // ============================================================
-//  Core sequence — runs one step at a time via timer callbacks
+//  Secuencia principal — un paso a la vez vía timers
 // ============================================================
 function runStep() {
 
-  // All steps finished?
   if (step >= intervals.length) {
-    print("=== Sequence complete. All " + intervals.length + " steps done. ===");
+    print("=== Secuencia completa. Los " + intervals.length + " pasos terminaron. ===");
     return;
   }
 
-  var durSec = intervals[step] * 60;   // convert minutes → seconds
-  var sw     = curSw;                  // snapshot for closure capture
-  var nSw    = otherSw(sw);            // next switch
+  var durSec = intervals[step] * 60;   // minutos → segundos
+  var sw     = curSw;                  // snapshot para el closure
+  var nSw    = otherSw(sw);            // siguiente switch
   var isLast = (step === intervals.length - 1);
 
   print(
-    ">>> Step " + (step + 1) + "/" + intervals.length +
+    ">>> Paso " + (step + 1) + "/" + intervals.length +
     " | Switch " + sw + " ON" +
-    " | Duration: " + intervals[step] + " min (" + durSec + "s)" +
-    (isLast ? " [LAST STEP]" : " | Next: Switch " + nSw)
+    " | Duración: " + intervals[step] + " min (" + durSec + "s)" +
+    (isLast ? " [ÚLTIMO PASO]" : " | Siguiente: Switch " + nSw)
   );
 
-  // Turn ON the current switch for this step
   Shelly.call("Switch.Set", {id: sw, on: true}, null);
 
   if (!isLast) {
-    // ---- Overlap timer: fires 2 s before the end ----
+    // ---- Timer de solapamiento: dispara 2s antes del final ----
     overlapTimer = Timer.set(
       (durSec - 2) * 1000,
       false,
       function() {
-        print(
-          "[OVERLAP] Switch " + nSw + " ON — " +
-          "both switches active for 2 seconds."
-        );
+        print("[SOLAPAMIENTO] Switch " + nSw + " ON — ambos switches activos por 2 segundos.");
         Shelly.call("Switch.Set", {id: nSw, on: true}, null);
       }
     );
 
-    // ---- Main timer: fires at the end of this step ----
+    // ---- Timer principal: dispara al final de este paso ----
     mainTimer = Timer.set(
       durSec * 1000,
       false,
       function() {
-        print(
-          "[HANDOVER] Switch " + sw + " OFF — " +
-          "Switch " + nSw + " continues."
-        );
+        print("[RELEVO] Switch " + sw + " OFF — Switch " + nSw + " continúa.");
         Shelly.call("Switch.Set", {id: sw, on: false}, null);
         curSw = nSw;
         step++;
-        runStep();       // advance to next step
+        runStep();
       }
     );
 
   } else {
-    // ---- Last step: no overlap, just turn off and finish ----
+    // ---- Último paso: sin solapamiento, solo apagar y terminar ----
     mainTimer = Timer.set(
       durSec * 1000,
       false,
       function() {
-        print("[LAST] Switch " + sw + " OFF. Sequence finished.");
+        print("[FINAL] Switch " + sw + " OFF. Secuencia terminada.");
         Shelly.call("Switch.Set", {id: sw, on: false}, null);
       }
     );
@@ -130,28 +122,48 @@ function runStep() {
 }
 
 // ============================================================
-//  Entry point — time-check then start sequence
+//  Manejador de evento de parada externa
+// ============================================================
+//  Captura eventos de "script detenido" a nivel de dispositivo
+//  (ej. detenido desde la app o vía RPC) para apagar ambos
+//  switches y cancelar los timers pendientes.
+// ============================================================
+Shelly.addEventHandler(function(event) {
+  if (!event) return;
+
+  var isScriptEvent = (
+    typeof event.component === "string" &&
+    event.component.indexOf("script") === 0
+  );
+
+  if (isScriptEvent && event.event === "stopped") {
+    print("Evento externo 'stopped' recibido. Ejecutando limpieza.");
+    cleanup();
+  }
+});
+
+// ============================================================
+//  Punto de entrada — verifica la hora y arranca la secuencia
 // ============================================================
 function start() {
-  print("=== Script starting. Checking device time... ===");
+  print("=== Script iniciando. Verificando hora del dispositivo... ===");
 
   Shelly.call("Sys.GetStatus", {}, function(res, code, msg) {
 
-    // ---- Guard: RPC call failed ----
     if (code !== 0 || !res || !res.time) {
-      print("ERROR: Could not read device time (code=" + code +
-            ", msg=" + msg + "). Aborting.");
+      print("ERROR: No se pudo leer la hora del dispositivo (code=" + code +
+            ", msg=" + msg + "). Abortando.");
       return;
     }
 
-    var timeStr = res.time;   // "HH:MM" local time from device
+    var timeStr = res.time;   // "HH:MM" hora local del dispositivo
     var colon   = timeStr.indexOf(":");
     if (colon < 0) {
-      print("ERROR: Unexpected time format: '" + timeStr + "'. Aborting.");
+      print("ERROR: Formato de hora inesperado: '" + timeStr + "'. Abortando.");
       return;
     }
 
-    // Parse HH and MM manually (parseInt is mJS-safe but let's stay explicit)
+    // Parsear HH y MM manualmente
     var hStr = timeStr.substring(0, colon);
     var mStr = timeStr.substring(colon + 1, colon + 3);
     var h = 0, m = 0, i;
@@ -163,33 +175,32 @@ function start() {
     var endMin   = TIME_END_H   * 60 + TIME_END_M;
 
     print(
-      "Device time : " + timeStr +
-      " | Allowed window: " +
+      "Hora del dispositivo: " + timeStr +
+      " | Ventana permitida: " +
       pad2(TIME_START_H) + ":" + pad2(TIME_START_M) +
       " – " +
       pad2(TIME_END_H)   + ":" + pad2(TIME_END_M)
     );
 
-    // ---- Time window check ----
     if (nowMin < startMin || nowMin >= endMin) {
-      print("Outside allowed time window (" + timeStr + "). Script aborted.");
+      print("Fuera de la ventana horaria permitida (" + timeStr + "). Script abortado.");
       return;
     }
 
-    print("Time check PASSED. Setting up sequence...");
+    print("Verificación de hora OK. Preparando secuencia...");
 
-    // ---- Build and shuffle a fresh copy of INTERVALS ----
+    // ---- Construir y mezclar una copia nueva de INTERVALS ----
     intervals = [];
     for (var k = 0; k < INTERVALS.length; k++) {
       intervals.push(INTERVALS[k]);
     }
     shuffle(intervals);
-    print("Shuffled intervals : " + arrToStr(intervals) + " (minutes)");
+    print("Intervalos mezclados: " + arrToStr(intervals) + " (minutos)");
 
-    // ---- Initialise state and kick off first step ----
+    // ---- Inicializar estado y arrancar el primer paso ----
     step  = 0;
-    curSw = 1;    // sequence starts with Switch 1
-    print("Starting with Switch " + curSw + ".");
+    curSw = 1;    // la secuencia empieza con el Switch 1
+    print("Iniciando con Switch " + curSw + ".");
     runStep();
   });
 }

@@ -1,63 +1,102 @@
 // ============================================================
-// Shelly 2PM - Script de conmutación alterna
-// Los interruptores alternan su estado cada 1 segundo durante 12 segundos
-// Interruptor 0: inicia ENCENDIDO, Interruptor 1: inicia APAGADO
-// Al llegar a TOTAL_TICKS, ambos interruptores se apagan y el temporizador se detiene
+// Shelly 2PM — Rapid Alternating Switch Script
+// Alternates Switch 0 and Switch 1 every 500ms for 20 ticks.
 // ============================================================
 
-var TOTAL_TICKS = 20;    // Número total de intervalos
-var INTERVAL_MS = 500;  // Duración del intervalo en milisegundos
-var tick        = 0;     // Contador de ticks actual
-var timerId     = null;  // Referencia al temporizador
+var TOTAL_TICKS  = 20;      // Total number of ticks before stopping
+var INTERVAL_MS  = 500;     // Timer interval in milliseconds
 
-// Aplica el estado correspondiente a un tick dado
-function applyState(t) {
-  var sw0 = (t % 2 === 0);
-  var sw1 = !sw0;
+var tickCount = 0;          // Counts how many ticks have fired
+var step      = 0;          // 0 = SW0 ON / SW1 OFF, 1 = SW0 OFF / SW1 ON
+var timerId   = null;       // Holds the active timer reference
 
-  Shelly.call("Switch.Set", { id: 0, on: sw0 }, function (result, error_code, error_message) {
-    if (error_code !== 0) {
-      print("Error al ajustar Switch 0: " + error_message);
+// ------------------------------------------------------------
+// setSwitch — Sends a Switch.Set RPC call with error handling
+// ------------------------------------------------------------
+function setSwitch(id, on) {
+  Shelly.call(
+    "Switch.Set",
+    { id: id, on: on },
+    function(result, error_code, error_message) {
+      if (error_code !== 0) {
+        print(
+          "[ERROR] Switch.Set failed for Switch " + id +
+          " | code: " + error_code +
+          " | msg: "  + error_message
+        );
+      }
     }
-  });
-
-  Shelly.call("Switch.Set", { id: 1, on: sw1 }, function (result, error_code, error_message) {
-    if (error_code !== 0) {
-      print("Error al ajustar Switch 1: " + error_message);
-    }
-  });
-
-  print("Tick " + t + " | Switch 0: " + sw0 + " | Switch 1: " + sw1);
+  );
 }
 
-// Detiene el temporizador y apaga ambos interruptores
-function shutdown() {
+// ------------------------------------------------------------
+// shutdownAll — Turns both switches OFF and cleans up timer
+// ------------------------------------------------------------
+function shutdownAll() {
+  print("========================================");
+  print("Sequence complete after " + TOTAL_TICKS + " ticks.");
+  print("Turning Switch 0 OFF and Switch 1 OFF...");
+  print("========================================");
+
+  setSwitch(0, false);
+  setSwitch(1, false);
+
   if (timerId !== null) {
     Timer.clear(timerId);
-    timerId = null; // Evita referencias a un temporizador ya eliminado
+    timerId = null;
+    print("Timer stopped. Script finished.");
   }
-
-  Shelly.call("Switch.Set", { id: 0, on: false });
-  Shelly.call("Switch.Set", { id: 1, on: false });
-
-  print("Secuencia completa. Ambos interruptores APAGADOS.");
 }
 
-// Evita ejecuciones duplicadas si el script se reinicia mientras el timer sigue activo
-if (timerId !== null) {
-  Timer.clear(timerId);
-  timerId = null;
+// ------------------------------------------------------------
+// onTick — Runs every 500ms; applies current step, then toggles
+// ------------------------------------------------------------
+function onTick() {
+  tickCount++;
+
+  // Determine switch states based on current step
+  var sw0On = (step === 0);
+  var sw1On = (step === 1);
+
+  // Apply states to both switches
+  setSwitch(0, sw0On);
+  setSwitch(1, sw1On);
+
+  // Log current state to console
+  print(
+    "Tick " + tickCount + "/" + TOTAL_TICKS +
+    " | Switch 0: " + (sw0On ? "ON " : "OFF") +
+    " | Switch 1: " + (sw1On ? "ON " : "OFF")
+  );
+
+  // Toggle step for next tick (0 -> 1 -> 0 -> ...)
+  step = (step === 0) ? 1 : 0;
+
+  // Check stopping condition
+  if (tickCount >= TOTAL_TICKS) {
+    shutdownAll();
+  }
 }
 
-// Aplica el estado inicial (tick 0 → SW0=ON, SW1=OFF)
-applyState(tick);
+// ------------------------------------------------------------
+// start — Initializes state and starts the repeating timer
+// ------------------------------------------------------------
+function start() {
+  print("========================================");
+  print("Starting alternating sequence...");
+  print("Ticks: " + TOTAL_TICKS + " | Interval: " + INTERVAL_MS + "ms");
+  print("Duration: " + (TOTAL_TICKS * INTERVAL_MS / 1000) + " seconds");
+  print("========================================");
 
-// Inicia el temporizador repetitivo
-timerId = Timer.set(INTERVAL_MS, true, function () {
-  tick++;
-  applyState(tick);
+  // Reset counters
+  tickCount = 0;
+  step      = 0;
+  timerId   = null;
 
-  if (tick >= TOTAL_TICKS) {
-    shutdown();
-  }
-});
+  // Start the repeating timer (true = repeat)
+  timerId = Timer.set(INTERVAL_MS, true, onTick);
+  print("Timer started (ID: " + timerId + "). First tick in " + INTERVAL_MS + "ms...");
+}
+
+// Entry point
+start();

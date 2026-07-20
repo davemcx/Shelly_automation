@@ -1,17 +1,17 @@
 // ============================================================
-// Shelly 2PM — Rapid Alternating Switch Script
-// Alternates Switch 0 and Switch 1 every 500ms for 20 ticks.
+// Shelly 2PM — Alternancia rápida de switches
+// Alterna Switch 0 y Switch 1 cada 500ms durante 20 ticks.
 // ============================================================
 
-var TOTAL_TICKS  = 20;      // Total number of ticks before stopping
-var INTERVAL_MS  = 500;     // Timer interval in milliseconds
+var TOTAL_TICKS = 20;   // Total de ticks antes de detenerse
+var INTERVAL_MS = 500;  // Intervalo del timer en milisegundos
 
-var tickCount = 0;          // Counts how many ticks have fired
-var step      = 0;          // 0 = SW0 ON / SW1 OFF, 1 = SW0 OFF / SW1 ON
-var timerId   = null;       // Holds the active timer reference
+var tickCount = 0;      // Cuántos ticks han disparado
+var step      = 0;      // 0 = SW0 ON / SW1 OFF, 1 = SW0 OFF / SW1 ON
+var timerId   = null;   // Referencia al timer activo
 
 // ------------------------------------------------------------
-// setSwitch — Sends a Switch.Set RPC call with error handling
+// setSwitch — Envía Switch.Set con manejo de error
 // ------------------------------------------------------------
 function setSwitch(id, on) {
   Shelly.call(
@@ -20,7 +20,7 @@ function setSwitch(id, on) {
     function(result, error_code, error_message) {
       if (error_code !== 0) {
         print(
-          "[ERROR] Switch.Set failed for Switch " + id +
+          "[ERROR] Switch.Set falló para Switch " + id +
           " | code: " + error_code +
           " | msg: "  + error_message
         );
@@ -30,12 +30,12 @@ function setSwitch(id, on) {
 }
 
 // ------------------------------------------------------------
-// shutdownAll — Turns both switches OFF and cleans up timer
+// shutdownAll — Apaga ambos switches y limpia el timer
 // ------------------------------------------------------------
 function shutdownAll() {
   print("========================================");
-  print("Sequence complete after " + TOTAL_TICKS + " ticks.");
-  print("Turning Switch 0 OFF and Switch 1 OFF...");
+  print("Secuencia completa tras " + TOTAL_TICKS + " ticks.");
+  print("Apagando Switch 0 y Switch 1...");
   print("========================================");
 
   setSwitch(0, false);
@@ -44,59 +44,74 @@ function shutdownAll() {
   if (timerId !== null) {
     Timer.clear(timerId);
     timerId = null;
-    print("Timer stopped. Script finished.");
+    print("Timer detenido. Script finalizado.");
   }
 }
 
 // ------------------------------------------------------------
-// onTick — Runs every 500ms; applies current step, then toggles
+// onTick — Corre cada 500ms; aplica el paso actual y alterna
 // ------------------------------------------------------------
 function onTick() {
   tickCount++;
 
-  // Determine switch states based on current step
   var sw0On = (step === 0);
   var sw1On = (step === 1);
 
-  // Apply states to both switches
   setSwitch(0, sw0On);
   setSwitch(1, sw1On);
 
-  // Log current state to console
   print(
     "Tick " + tickCount + "/" + TOTAL_TICKS +
     " | Switch 0: " + (sw0On ? "ON " : "OFF") +
     " | Switch 1: " + (sw1On ? "ON " : "OFF")
   );
 
-  // Toggle step for next tick (0 -> 1 -> 0 -> ...)
+  // Alterna el paso para el próximo tick (0 -> 1 -> 0 -> ...)
   step = (step === 0) ? 1 : 0;
 
-  // Check stopping condition
   if (tickCount >= TOTAL_TICKS) {
     shutdownAll();
   }
 }
 
 // ------------------------------------------------------------
-// start — Initializes state and starts the repeating timer
+// Manejador de evento de parada externa
+// ------------------------------------------------------------
+// Captura el evento "script detenido" a nivel de dispositivo
+// (ej. detenido desde la app o vía RPC) para apagar ambos
+// switches y cancelar el timer, evitando que uno quede encendido.
+// ------------------------------------------------------------
+Shelly.addEventHandler(function(event) {
+  if (!event) return;
+
+  var isScriptEvent = (
+    typeof event.component === "string" &&
+    event.component.indexOf("script") === 0
+  );
+
+  if (isScriptEvent && event.event === "stopped") {
+    print("Evento externo 'stopped' recibido. Ejecutando apagado de seguridad.");
+    shutdownAll();
+  }
+});
+
+// ------------------------------------------------------------
+// start — Inicializa el estado y arranca el timer repetitivo
 // ------------------------------------------------------------
 function start() {
   print("========================================");
-  print("Starting alternating sequence...");
-  print("Ticks: " + TOTAL_TICKS + " | Interval: " + INTERVAL_MS + "ms");
-  print("Duration: " + (TOTAL_TICKS * INTERVAL_MS / 1000) + " seconds");
+  print("Iniciando secuencia alternada...");
+  print("Ticks: " + TOTAL_TICKS + " | Intervalo: " + INTERVAL_MS + "ms");
+  print("Duración: " + (TOTAL_TICKS * INTERVAL_MS / 1000) + " segundos");
   print("========================================");
 
-  // Reset counters
   tickCount = 0;
   step      = 0;
   timerId   = null;
 
-  // Start the repeating timer (true = repeat)
-  timerId = Timer.set(INTERVAL_MS, true, onTick);
-  print("Timer started (ID: " + timerId + "). First tick in " + INTERVAL_MS + "ms...");
+  timerId = Timer.set(INTERVAL_MS, true, onTick); // true = repetitivo
+  print("Timer iniciado (ID: " + timerId + "). Primer tick en " + INTERVAL_MS + "ms...");
 }
 
-// Entry point
+// Punto de entrada
 start();

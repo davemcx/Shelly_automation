@@ -1,160 +1,156 @@
 // =============================================================================
-// Shelly Gen3 Cover – Gradual Shutter Position Script
+// Shelly Gen3 Cover – Posicionamiento gradual del toldo/persiana
 // =============================================================================
-// Goal: Gradually open the shutter across two daily time windows:
-//   Window 1: 08:00 → 13:00  — from current position up to 30%
-//   Window 2: 13:00 → 21:30  — from 30% up to 75%
-//
-// The script runs a check every 15 minutes and calculates the ideal
-// target position at that moment using linear interpolation.
+// Ventana 1: 08:00 → 13:00 — desde la posición actual hasta 30%
+// Ventana 2: 13:00 → 21:30 — desde 30% hasta 75%
+// Revisa cada 15 minutos y calcula la posición objetivo por interpolación lineal.
+// El estado de la Ventana 1 (posición capturada) se persiste en KVS por si el
+// dispositivo se reinicia a mitad de la ventana.
 // =============================================================================
 
-// --- Configuration -----------------------------------------------------------
+// --- Configuración ------------------------------------------------------------
 
-var COVER_ID = 0; // Cover channel ID (0 for single-cover devices)
+var COVER_ID = 0; // ID del canal de la persiana (0 si es un solo dispositivo)
 
-// Window 1: 08:00 to 13:00 → ramp from startPos (captured at 08:00) to 30%
-var WIN1_START_HOUR   = 8;
-var WIN1_START_MIN    = 0;
-var WIN1_END_HOUR     = 13;
-var WIN1_END_MIN      = 0;
-var WIN1_TARGET_POS   = 30; // % open at end of Window 1
+var WIN1_START_HOUR = 8;
+var WIN1_START_MIN  = 0;
+var WIN1_END_HOUR    = 13;
+var WIN1_END_MIN     = 0;
+var WIN1_TARGET_POS  = 30; // % al final de la Ventana 1
 
-// Window 2: 13:00 to 21:30 → ramp from 30% to 75%
-var WIN2_START_HOUR   = 13;
-var WIN2_START_MIN    = 0;
-var WIN2_END_HOUR     = 21;
-var WIN2_END_MIN      = 30;
-var WIN2_START_POS    = 30;  // % open at start of Window 2
-var WIN2_TARGET_POS   = 75;  // % open at end of Window 2
+var WIN2_START_HOUR = 13;
+var WIN2_START_MIN  = 0;
+var WIN2_END_HOUR    = 21;
+var WIN2_END_MIN     = 30;
+var WIN2_START_POS   = WIN1_TARGET_POS; // arranca donde terminó la Ventana 1
+var WIN2_TARGET_POS  = 75;              // % al final de la Ventana 2
 
-// How often the script checks and adjusts position (milliseconds)
-var CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+var CHECK_INTERVAL_MS  = 15 * 60 * 1000; // 15 minutos
+var POSITION_TOLERANCE = 1;              // no mover si ya está a ±1% del objetivo
 
-// Tolerance: don't send a command if already within ±1% of target
-var POSITION_TOLERANCE = 1;
+var KVS_KEY = "cover_win1_state"; // persistencia de la captura de la Ventana 1
 
-// --- State -------------------------------------------------------------------
+// --- Estado ---------------------------------------------------------------
 
-// Captured starting position for Window 1 (read from device at window open)
-var win1StartPos     = -1;   // -1 means "not yet captured"
-var win1StartCaptured = false;
+var win1StartPos      = -1;    // posición capturada al iniciar la Ventana 1
+var win1StartCaptured  = false;
 
-// =============================================================================
-// HELPER: Convert hours + minutes to total minutes since midnight
-// =============================================================================
+// Convierte horas + minutos a minutos totales desde medianoche
 function toMinutes(h, m) {
   return h * 60 + m;
 }
 
-// =============================================================================
-// HELPER: Linear interpolation
-// Returns the ideal position at elapsed/total progress through a range
-//   startPos → endPos
-// =============================================================================
+// Interpolación lineal: posición ideal según progreso (elapsed/total) entre startPos y endPos
 function lerp(startPos, endPos, elapsed, total) {
   if (total <= 0) return endPos;
   var ratio = elapsed / total;
   if (ratio < 0) ratio = 0;
   if (ratio > 1) ratio = 1;
-  // Round to nearest integer — Cover.GoToPosition expects whole numbers
   return Math.round(startPos + ratio * (endPos - startPos));
 }
 
-// =============================================================================
-// CORE: Determine the target position based on current time
-// Returns -1 if outside both windows (no action needed)
-// =============================================================================
+// Guarda en KVS si ya se capturó la posición inicial de la Ventana 1 y cuál fue
+function saveWin1State(cb) {
+  var payload = JSON.stringify({ captured: win1StartCaptured, startPos: win1StartPos });
+  Shelly.call("KVS.Set", { key: KVS_KEY, value: payload }, function(res, err_code, err_msg) {
+    if (err_code !== 0) {
+      print("[ERROR] KVS.Set falló: " + err_msg);
+    }
+    if (cb) cb(err_code === 0);
+  });
+}
+
+// Cambia el estado de captura de la Ventana 1 y lo persiste
+function setWin1Captured(captured, startPos) {
+  win1StartCaptured = captured;
+  win1StartPos      = (startPos === undefined) ? win1StartPos : startPos;
+  saveWin1State();
+}
+
+// Determina la posición objetivo según la hora actual. -1 si está fuera de ambas ventanas.
 function getTargetPosition(nowMin, currentPos) {
 
-  var win1Start = toMinutes(WIN1_START_HOUR, WIN1_START_MIN); // 480
-  var win1End   = toMinutes(WIN1_END_HOUR,   WIN1_END_MIN);   // 780
-  var win2Start = toMinutes(WIN2_START_HOUR, WIN2_START_MIN); // 780
-  var win2End   = toMinutes(WIN2_END_HOUR,   WIN2_END_MIN);   // 1290
+  var win1Start = toMinutes(WIN1_START_HOUR, WIN1_START_MIN);
+  var win1End   = toMinutes(WIN1_END_HOUR,   WIN1_END_MIN);
+  var win2Start = toMinutes(WIN2_START_HOUR, WIN2_START_MIN);
+  var win2End   = toMinutes(WIN2_END_HOUR,   WIN2_END_MIN);
 
-  // --- Window 1: 08:00 – 13:00 ---
+  // --- Ventana 1 ---
   if (nowMin >= win1Start && nowMin < win1End) {
 
-    // Capture the shutter's actual position at the very start of Window 1
+    // Captura la posición real solo al inicio de la ventana (o al reanudar sin captura previa)
     if (!win1StartCaptured) {
-      win1StartPos      = currentPos;
-      win1StartCaptured = true;
-      print("[W1] Captured start position: " + win1StartPos + "%");
+      setWin1Captured(true, currentPos);
+      print("[V1] Posición inicial capturada: " + win1StartPos + "%");
     }
 
     var elapsed = nowMin - win1Start;
-    var total   = win1End - win1Start; // 300 minutes
+    var total   = win1End - win1Start;
     var target  = lerp(win1StartPos, WIN1_TARGET_POS, elapsed, total);
-    print("[W1] Now=" + nowMin + "min | Elapsed=" + elapsed + "min | Target=" + target + "%");
+    print("[V1] Ahora=" + nowMin + "min | Transcurrido=" + elapsed + "min | Objetivo=" + target + "%");
     return target;
   }
 
-  // --- Window 2: 13:00 – 21:30 ---
+  // --- Ventana 2 ---
   if (nowMin >= win2Start && nowMin < win2End) {
 
-    // Reset W1 capture flag so it re-captures tomorrow
-    win1StartCaptured = false;
+    if (win1StartCaptured) {
+      setWin1Captured(false); // para volver a capturar mañana
+    }
 
     var elapsed2 = nowMin - win2Start;
-    var total2   = win2End - win2Start; // 510 minutes
+    var total2   = win2End - win2Start;
     var target2  = lerp(WIN2_START_POS, WIN2_TARGET_POS, elapsed2, total2);
-    print("[W2] Now=" + nowMin + "min | Elapsed=" + elapsed2 + "min | Target=" + target2 + "%");
+    print("[V2] Ahora=" + nowMin + "min | Transcurrido=" + elapsed2 + "min | Objetivo=" + target2 + "%");
     return target2;
   }
 
-  // Outside both windows — no movement
-  return -1;
+  return -1; // fuera de ambas ventanas
 }
 
-// =============================================================================
-// CORE: Move the cover to targetPos (if not already there)
-// =============================================================================
+// Mueve la persiana a targetPos, solo si hace falta y solo hacia adelante (nunca cierra)
 function moveCoverTo(targetPos) {
-  // Get current status first so we only move if needed
   Shelly.call(
     "Cover.GetStatus",
     { id: COVER_ID },
     function(result, error_code, error_message) {
 
       if (error_code !== 0 || !result) {
-        print("[ERROR] Cover.GetStatus failed: " + error_message);
+        print("[ERROR] Cover.GetStatus falló: " + error_message);
         return;
       }
 
       var currentPos = result.current_pos;
 
-      // current_pos may be null if cover is moving or uncalibrated
+      // current_pos puede ser null si la persiana se está moviendo o no está calibrada
       if (currentPos === null || currentPos === undefined) {
-        print("[WARN] current_pos unavailable — cover may be moving or uncalibrated.");
+        print("[AVISO] current_pos no disponible.");
         return;
       }
 
-      print("[INFO] Current position: " + currentPos + "% | Target: " + targetPos + "%");
+      print("[INFO] Posición actual: " + currentPos + "% | Objetivo: " + targetPos + "%");
 
-      // Only send the command if we're meaningfully far from the target
-      var diff = targetPos - currentPos;
-      if (diff < 0) diff = -diff; // Math.abs alternative
-
+      var diff = Math.abs(targetPos - currentPos);
       if (diff <= POSITION_TOLERANCE) {
-        print("[INFO] Already within tolerance (" + POSITION_TOLERANCE + "%). No movement needed.");
+        print("[INFO] Ya está dentro de la tolerancia. No se mueve.");
         return;
       }
 
-      // Only move the cover forward (open further) — never close it
+      // Solo abrir más, nunca cerrar
       if (targetPos <= currentPos) {
-        print("[INFO] Target ≤ current position. Skipping to avoid closing.");
+        print("[INFO] Objetivo ≤ posición actual. Se omite para no cerrar.");
         return;
       }
 
-      print("[ACTION] Moving cover to " + targetPos + "%");
+      print("[ACCIÓN] Moviendo persiana a " + targetPos + "%");
       Shelly.call(
         "Cover.GoToPosition",
         { id: COVER_ID, pos: targetPos },
         function(res, err_code, err_msg) {
           if (err_code !== 0) {
-            print("[ERROR] Cover.GoToPosition failed: " + err_msg);
+            print("[ERROR] Cover.GoToPosition falló: " + err_msg);
           } else {
-            print("[OK] Cover moving to " + targetPos + "%");
+            print("[OK] Persiana moviéndose a " + targetPos + "%");
           }
         }
       );
@@ -162,66 +158,55 @@ function moveCoverTo(targetPos) {
   );
 }
 
-// =============================================================================
-// CORE: Main tick — called every 15 minutes
-// =============================================================================
+// Ciclo principal, se ejecuta cada 15 minutos
 function tick() {
-  // Get current device time
   Shelly.call(
     "Sys.GetStatus",
     {},
     function(result, error_code, error_message) {
 
       if (error_code !== 0 || !result) {
-        print("[ERROR] Sys.GetStatus failed: " + error_message);
+        print("[ERROR] Sys.GetStatus falló: " + error_message);
         return;
       }
 
-      // unixtime → local time-of-day in minutes
-      // Note: Shelly local time uses the device's configured timezone
-      var unixtime  = result.time; // seconds since epoch (local offset not applied here)
+      // result.time llega como string "HH:MM" en hora local del dispositivo.
+      // Se usa parseInt (no JSON.parse) porque "08", "05", etc. no son JSON válido.
+      var timeStr  = result.time; // ej. "08:15"
+      var colonIdx = timeStr.indexOf(":");
+      var hours    = parseInt(timeStr.substring(0, colonIdx), 10);
+      var mins     = parseInt(timeStr.substring(colonIdx + 1), 10);
+      var nowMin   = toMinutes(hours, mins);
 
-      // Use the human-readable time string (format "HH:MM") provided by Sys.GetStatus
-      // result.time is actually the human-readable "HH:MM" string on Gen2/Gen3 devices
-      var timeStr   = result.time; // e.g. "08:15"
-      var colonIdx  = timeStr.indexOf(":");
-      var hours     = JSON.parse(timeStr.substring(0, colonIdx));
-      var mins      = JSON.parse(timeStr.substring(colonIdx + 1));
-      var nowMin    = toMinutes(hours, mins);
+      print("[TICK] Hora local: " + timeStr + " (" + nowMin + " min desde medianoche)");
 
-      print("[TICK] Local time: " + timeStr + " (" + nowMin + " min since midnight)");
-
-      // Get current cover position to feed into window calculations
       Shelly.call(
         "Cover.GetStatus",
         { id: COVER_ID },
         function(coverResult, coverErr, coverErrMsg) {
 
           if (coverErr !== 0 || !coverResult) {
-            print("[ERROR] Cover.GetStatus in tick failed: " + coverErrMsg);
+            print("[ERROR] Cover.GetStatus (tick) falló: " + coverErrMsg);
             return;
           }
 
           var currentPos = coverResult.current_pos;
 
           if (currentPos === null || currentPos === undefined) {
-            print("[WARN] current_pos not available in tick.");
+            print("[AVISO] current_pos no disponible en tick.");
             return;
           }
 
-          // Calculate where we should be right now
           var targetPos = getTargetPosition(nowMin, currentPos);
 
           if (targetPos < 0) {
-            print("[INFO] Outside active windows. No action.");
-            // Reset W1 capture at night so it re-captures fresh tomorrow
-            if (nowMin < toMinutes(WIN1_START_HOUR, WIN1_START_MIN)) {
-              win1StartCaptured = false;
+            print("[INFO] Fuera de las ventanas activas. Sin acción.");
+            if (win1StartCaptured && nowMin < toMinutes(WIN1_START_HOUR, WIN1_START_MIN)) {
+              setWin1Captured(false); // reset nocturno para mañana
             }
             return;
           }
 
-          // Move to the calculated target
           moveCoverTo(targetPos);
         }
       );
@@ -229,16 +214,27 @@ function tick() {
   );
 }
 
-// =============================================================================
-// STARTUP
-// =============================================================================
-print("[STARTUP] Gradual Shutter Script loaded.");
-print("[STARTUP] Window 1: 08:00–13:00 → up to 30%");
-print("[STARTUP] Window 2: 13:00–21:30 → up to 75%");
-print("[STARTUP] Check interval: every 15 minutes.");
+// --- Arranque: cargar estado persistido antes de empezar a sondear ---------
 
-// Run immediately on startup so we don't wait 15 min for first check
-tick();
+Shelly.call("KVS.Get", { key: KVS_KEY }, function(res, err_code) {
+  if (err_code === 0 && res && res.value) {
+    var state = JSON.parse(res.value);
+    win1StartCaptured = !!state.captured;
+    win1StartPos      = (typeof state.startPos === "number") ? state.startPos : -1;
+    if (win1StartCaptured) {
+      print("[INICIO] Estado restaurado: Ventana 1 ya capturada en " + win1StartPos + "%");
+    } else {
+      print("[INICIO] Estado restaurado: Ventana 1 sin capturar.");
+    }
+  } else {
+    print("[INICIO] Sin estado previo. Se capturará al entrar en la Ventana 1.");
+  }
 
-// Then repeat every 15 minutes
-Timer.set(CHECK_INTERVAL_MS, true, tick);
+  print("[INICIO] Script de posicionamiento gradual cargado.");
+  print("[INICIO] Ventana 1: 08:00–13:00 → hasta 30%");
+  print("[INICIO] Ventana 2: 13:00–21:30 → hasta 75%");
+  print("[INICIO] Intervalo de chequeo: 15 min.");
+
+  tick(); // ejecuta de inmediato, sin esperar los primeros 15 min
+  Timer.set(CHECK_INTERVAL_MS, true, tick);
+});

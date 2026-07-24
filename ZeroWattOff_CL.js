@@ -1,15 +1,19 @@
 // ─── Configuración ─────────────────────────────────────────────
-var ZERO_DURATION_S  = 5;          // segundos en 0W antes de actuar
-var OFF_DURATION_S   = 5 * 60;     // segundos que el enchufe permanece OFF (5 min)
-var COOLDOWN_S       = 72 * 3600;  // segundos entre acciones permitidas (72 h)
-var KVS_KEY          = "plug_last_action_state";
-var CHECK_INTERVAL_S = 1;          // intervalo de sondeo en segundos
+var SWITCH_ID           = 0;        // id del interruptor a controlar
+var ZERO_DURATION_S      = 55;      // segundos en 0W antes de actuar
+var OFF_DURATION_S       = 5 * 60;  // segundos que el enchufe permanece OFF (5 min)
+var COOLDOWN_S           = 144 * 3600; // segundos entre acciones permitidas (144 h)
+var POWER_THRESHOLD_W    = 0.5;     // potencia por debajo de la cual se considera "0W" (ruido del medidor)
+var KVS_KEY              = "plug_last_action_state";
+var CHECK_INTERVAL_S     = 5;       // intervalo de sondeo en segundos
+var MAX_RESTORE_RETRIES  = 8;       // reintentos máximos al restaurar el ON
 // ────────────────────────────────────────────────────────────────
 
-var zeroSince     = null;  // ts unix cuando empezó la racha de 0W
-var lastActionTs  = 0;     // ts unix de la última acción de apagado
-var restoreAt     = 0;     // ts unix en el que se debe restaurar el ON
-var actionPending = false; // true mientras el enchufe está OFF o volviendo a ON
+var zeroSince      = null;   // ts unix cuando empezó la racha de 0W
+var lastActionTs   = 0;      // ts unix de la última acción de apagado
+var restoreAt      = 0;      // ts unix en el que se debe restaurar el ON
+var actionPending  = false;  // true mientras el enchufe está OFF o volviendo a ON
+var restoreRetries = 0;      // contador de reintentos de restauración
 
 // ── Utilidades ───────────────────────────────────────────────
 
@@ -18,13 +22,18 @@ function now() {
   return sys ? sys.unixtime : 0;
 }
 
+function switchKey() {
+  return "switch:" + SWITCH_ID;
+}
+
 // Guarda el estado persistente (ts de acción + momento de restauración)
-function saveState() {
+function saveState(cb) {
   var payload = JSON.stringify({ lastActionTs: lastActionTs, restoreAt: restoreAt });
   Shelly.call("KVS.Set", { key: KVS_KEY, value: payload }, function (res, err_code, err_msg) {
     if (err_code !== 0) {
       print("Error al guardar estado en KVS:", err_msg);
     }
+    if (cb) cb(err_code === 0);
   });
 }
 
@@ -35,7 +44,7 @@ function checkPower() {
 
   var t = now();
 
-  // Respeta el cooldown de 72 horas
+  // Respeta el cooldown de COOLDOWN_S
   if (t > 0 && t - lastActionTs < COOLDOWN_S) {
     if (zeroSince !== null) {
       var remaining = COOLDOWN_S - (t - lastActionTs);
@@ -45,7 +54,7 @@ function checkPower() {
     return;
   }
 
-  var sw = Shelly.getComponentStatus("switch:0");
+  var sw = Shelly.getComponentStatus(switchKey());
   if (!sw) return;
 
   // No iniciar el temporizador si el interruptor ya está apagado
@@ -56,10 +65,10 @@ function checkPower() {
 
   var power = (typeof sw.apower === "number") ? sw.apower : -1;
 
-  if (power === 0) {
+  if (power >= 0 && power <= POWER_THRESHOLD_W) {
     if (zeroSince === null) {
       zeroSince = t;
-      print("0W detectado — cuenta regresiva iniciada.");
+      print("~0W detectado (", power, "W ) — cuenta regresiva iniciada.");
     } else if (t - zeroSince >= ZERO_DURATION_S) {
       triggerOff(t);
     }
@@ -72,35 +81,46 @@ function checkPower() {
 }
 
 function triggerOff(t) {
-  print("0W sostenido por", ZERO_DURATION_S, "s → apagando por", OFF_DURATION_S / 60, "min.");
-  actionPending = true;
-  lastActionTs  = t;
-  restoreAt     = t + OFF_DURATION_S;
+  print("~0W sostenido por", ZERO_DURATION_S, "s → apagando por", OFF_DURATION_S / 60, "min.");
+  actionPending = true; // bloquea checkPower mientras se confirma la acción
   zeroSince     = null;
-  saveState();
 
-  Shelly.call("Switch.Set", { id: 0, on: false }, function (res, err_code, err_msg) {
+  Shelly.call("Switch.Set", { id: SWITCH_ID, on: false }, function (res, err_code, err_msg) {
     if (err_code !== 0) {
-      print("Error al apagar el enchufe:", err_msg);
-      actionPending = false; // libera el bloqueo si falló el apagado
+      print("Error al apagar el enchufe:", err_msg, "— no se registra cooldown, se reintentará en el próximo sondeo.");
+      actionPending = false; // libera el bloqueo si falló el apagado; no se guarda estado
       return;
     }
-    print("Enchufe apagado. Se restaurará en", OFF_DURATION_S / 60, "min.");
-    scheduleRestore(OFF_DURATION_S);
+
+    // Solo al confirmar el apagado se registra la acción y el cooldown
+    lastActionTs = t;
+    restoreAt    = t + OFF_DURATION_S;
+    saveState(function () {
+      print("Enchufe apagado. Se restaurará en", OFF_DURATION_S / 60, "min.");
+      restoreRetries = 0;
+      scheduleRestore(OFF_DURATION_S);
+    });
   });
 }
 
 function scheduleRestore(delaySeconds) {
   Timer.set(delaySeconds * 1000, false, function () {
     print("Restaurando el enchufe a ON.");
-    Shelly.call("Switch.Set", { id: 0, on: true }, function (res, err_code, err_msg) {
+    Shelly.call("Switch.Set", { id: SWITCH_ID, on: true }, function (res, err_code, err_msg) {
       if (err_code !== 0) {
-        print("Error al restaurar el enchufe, reintentando en 10 s:", err_msg);
+        restoreRetries++;
+        if (restoreRetries > MAX_RESTORE_RETRIES) {
+          print("Error al restaurar el enchufe tras", MAX_RESTORE_RETRIES, "intentos. Abandonando reintentos:", err_msg);
+          actionPending = false; // evita que el script quede bloqueado para siempre
+          return;
+        }
+        print("Error al restaurar el enchufe (intento", restoreRetries, "), reintentando en 10 s:", err_msg);
         Timer.set(10 * 1000, false, function () { scheduleRestore(0); });
         return;
       }
-      actionPending = false;
-      print("Enchufe restaurado. Próxima acción permitida tras 72 h.");
+      actionPending  = false;
+      restoreRetries = 0;
+      print("Enchufe restaurado. Próxima acción permitida tras", COOLDOWN_S / 3600, "h.");
     });
   });
 }
@@ -120,7 +140,7 @@ Shelly.call("KVS.Get", { key: KVS_KEY }, function (res, err_code) {
       var remainingOff = restoreAt - t;
       print("Reanudado durante periodo OFF. Restaurando en", remainingOff, "s.");
       actionPending = true;
-      Shelly.call("Switch.Set", { id: 0, on: false }, function () {
+      Shelly.call("Switch.Set", { id: SWITCH_ID, on: false }, function () {
         scheduleRestore(remainingOff);
       });
     } else {

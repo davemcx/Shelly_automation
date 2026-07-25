@@ -1,240 +1,146 @@
-// =============================================================================
-// Shelly Gen3 Cover – Posicionamiento gradual del toldo/persiana
-// =============================================================================
-// Ventana 1: 08:00 → 13:00 — desde la posición actual hasta 30%
-// Ventana 2: 13:00 → 21:30 — desde 30% hasta 75%
-// Revisa cada 15 minutos y calcula la posición objetivo por interpolación lineal.
-// El estado de la Ventana 1 (posición capturada) se persiste en KVS por si el
-// dispositivo se reinicia a mitad de la ventana.
-// =============================================================================
+// ============================================================
+// Apertura gradual de persiana — Shelly 2PM Gen3 (mJS)
+// Ventana 1 → 08:00–13:00: posición matutina → 40%
+// Ventana 2 → 13:00–21:30: 40% → 75%
+// Comprobación cada 15 min + al arrancar. Solo apertura (one-way).
+// ============================================================
 
-// --- Configuración ------------------------------------------------------------
+var COVER_ID          = 0;
+var KVS_KEY            = "blind_morning_pos";
+var CHECK_INTERVAL_MS  = 15 * 60 * 1000;
+var TOLERANCE          = 1;     // margen ±1%
 
-var COVER_ID = 0; // ID del canal de la persiana (0 si es un solo dispositivo)
+var W1_START = 8  * 60;
+var W1_END   = 13 * 60;
+var W1_TO    = 40;
 
-var WIN1_START_HOUR = 8;
-var WIN1_START_MIN  = 0;
-var WIN1_END_HOUR    = 13;
-var WIN1_END_MIN     = 0;
-var WIN1_TARGET_POS  = 30; // % al final de la Ventana 1
+var W2_START = 13 * 60;
+var W2_END   = 21 * 60 + 30;
+var W2_FROM  = 40;
+var W2_TO    = 75;
 
-var WIN2_START_HOUR = 13;
-var WIN2_START_MIN  = 0;
-var WIN2_END_HOUR    = 21;
-var WIN2_END_MIN     = 30;
-var WIN2_START_POS   = WIN1_TARGET_POS; // arranca donde terminó la Ventana 1
-var WIN2_TARGET_POS  = 75;              // % al final de la Ventana 2
-
-var CHECK_INTERVAL_MS  = 15 * 60 * 1000; // 15 minutos
-var POSITION_TOLERANCE = 1;              // no mover si ya está a ±1% del objetivo
-
-var KVS_KEY = "cover_win1_state"; // persistencia de la captura de la Ventana 1
-
-// --- Estado ---------------------------------------------------------------
-
-var win1StartPos      = -1;    // posición capturada al iniciar la Ventana 1
-var win1StartCaptured  = false;
-
-// Convierte horas + minutos a minutos totales desde medianoche
-function toMinutes(h, m) {
+function nowMinutes() {
+  var sys = Shelly.getComponentStatus("sys");
+  if (!sys || !sys.time) return -1;   // reloj aún no sincronizado
+  var t = sys.time;
+  var h = parseInt(t.substr(0, 2), 10);
+  var m = parseInt(t.substr(3, 2), 10);
   return h * 60 + m;
 }
 
-// Interpolación lineal: posición ideal según progreso (elapsed/total) entre startPos y endPos
-function lerp(startPos, endPos, elapsed, total) {
-  if (total <= 0) return endPos;
-  var ratio = elapsed / total;
+// Interpolación lineal, resultado acotado a [v0, v1]
+function lerp(t, t0, t1, v0, v1) {
+  var ratio = (t - t0) / (t1 - t0);
   if (ratio < 0) ratio = 0;
   if (ratio > 1) ratio = 1;
-  return Math.round(startPos + ratio * (endPos - startPos));
+  return v0 + ratio * (v1 - v0);
 }
 
-// Guarda en KVS si ya se capturó la posición inicial de la Ventana 1 y cuál fue
-function saveWin1State(cb) {
-  var payload = JSON.stringify({ captured: win1StartCaptured, startPos: win1StartPos });
-  Shelly.call("KVS.Set", { key: KVS_KEY, value: payload }, function(res, err_code, err_msg) {
-    if (err_code !== 0) {
-      print("[ERROR] KVS.Set falló: " + err_msg);
+function clamp(v, min, max) {
+  if (v < min) return min;
+  if (v > max) return max;
+  return v;
+}
+
+/**
+ * Obtiene la línea base matutina y el estado actual de la persiana
+ * en una sola pasada, y llama a cb(morningPos, coverStatus).
+ */
+function resolveState(now, cb) {
+  Shelly.call("Cover.GetStatus", { id: COVER_ID }, function (cov, ec, msg) {
+    if (ec !== 0 || !cov || cov.current_pos === undefined || cov.current_pos === null) {
+      print("Persiana: error leyendo estado (" + msg + ")");
+      cb(null, null);
+      return;
     }
-    if (cb) cb(err_code === 0);
+
+    if (now >= W1_START && now < W1_END) {
+      Shelly.call("KVS.Get", { key: KVS_KEY }, function (res, ec2) {
+        if (ec2 === 0 && res && res.value !== undefined) {
+          cb(parseFloat(res.value), cov);
+          return;
+        }
+        // Aún no hay línea base guardada: se toma la posición actual
+        Shelly.call("KVS.Set", { key: KVS_KEY, value: String(cov.current_pos) },
+          function (res2, ec3) {
+            if (ec3 !== 0) print("Persiana: error guardando línea base");
+            cb(cov.current_pos, cov);
+          }
+        );
+      });
+    } else if (now >= W1_END) {
+      // Fin de la ventana 1: se borra la línea base para el día siguiente
+      Shelly.call("KVS.Delete", { key: KVS_KEY }, function (res, ec2) {
+        if (ec2 !== 0) print("Persiana: error borrando línea base");
+        cb(null, cov);
+      });
+    } else {
+      cb(null, cov);
+    }
   });
 }
 
-// Cambia el estado de captura de la Ventana 1 y lo persiste
-function setWin1Captured(captured, startPos) {
-  win1StartCaptured = captured;
-  win1StartPos      = (startPos === undefined) ? win1StartPos : startPos;
-  saveWin1State();
-}
+function applyPosition(now, morningPos, cov) {
+  if (!cov) return;
 
-// Determina la posición objetivo según la hora actual. -1 si está fuera de ambas ventanas.
-function getTargetPosition(nowMin, currentPos) {
-
-  var win1Start = toMinutes(WIN1_START_HOUR, WIN1_START_MIN);
-  var win1End   = toMinutes(WIN1_END_HOUR,   WIN1_END_MIN);
-  var win2Start = toMinutes(WIN2_START_HOUR, WIN2_START_MIN);
-  var win2End   = toMinutes(WIN2_END_HOUR,   WIN2_END_MIN);
-
-  // --- Ventana 1 ---
-  if (nowMin >= win1Start && nowMin < win1End) {
-
-    // Captura la posición real solo al inicio de la ventana (o al reanudar sin captura previa)
-    if (!win1StartCaptured) {
-      setWin1Captured(true, currentPos);
-      print("[V1] Posición inicial capturada: " + win1StartPos + "%");
-    }
-
-    var elapsed = nowMin - win1Start;
-    var total   = win1End - win1Start;
-    var target  = lerp(win1StartPos, WIN1_TARGET_POS, elapsed, total);
-    print("[V1] Ahora=" + nowMin + "min | Transcurrido=" + elapsed + "min | Objetivo=" + target + "%");
-    return target;
+  // No actuar mientras la persiana está calibrando
+  if (cov.state === "calibrating") {
+    print("Persiana: calibrando, se omite.");
+    return;
   }
 
-  // --- Ventana 2 ---
-  if (nowMin >= win2Start && nowMin < win2End) {
+  var target = null;
 
-    if (win1StartCaptured) {
-      setWin1Captured(false); // para volver a capturar mañana
-    }
-
-    var elapsed2 = nowMin - win2Start;
-    var total2   = win2End - win2Start;
-    var target2  = lerp(WIN2_START_POS, WIN2_TARGET_POS, elapsed2, total2);
-    print("[V2] Ahora=" + nowMin + "min | Transcurrido=" + elapsed2 + "min | Objetivo=" + target2 + "%");
-    return target2;
+  if (now >= W1_START && now < W1_END) {
+    var base = (morningPos !== null && morningPos !== undefined) ? morningPos : 0;
+    target = lerp(now, W1_START, W1_END, base, W1_TO);
+  } else if (now >= W2_START && now < W2_END) {
+    target = lerp(now, W2_START, W2_END, W2_FROM, W2_TO);
   }
 
-  return -1; // fuera de ambas ventanas
+  if (target === null) {
+    print("Persiana: fuera de horario activo, inactiva.");
+    return;
+  }
+
+  target = clamp(Math.round(target), 0, 100);
+
+  var current = cov.current_pos;
+  var delta   = target - current;
+
+  print("Persiana: actual=" + current + "% | objetivo=" + target + "% | delta=" + delta + "%");
+
+  if (delta <= 0) {
+    print("Persiana: objetivo ≤ actual, se omite (regla one-way).");
+    return;
+  }
+
+  if (Math.abs(delta) <= TOLERANCE) {
+    print("Persiana: dentro de la tolerancia ±" + TOLERANCE + "%, se omite.");
+    return;
+  }
+
+  print("Persiana: moviendo a " + target + "%");
+  Shelly.call("Cover.SetPosition", { id: COVER_ID, pos: target });
 }
 
-// Mueve la persiana a targetPos, solo si hace falta y solo hacia adelante (nunca cierra)
-function moveCoverTo(targetPos) {
-  Shelly.call(
-    "Cover.GetStatus",
-    { id: COVER_ID },
-    function(result, error_code, error_message) {
-
-      if (error_code !== 0 || !result) {
-        print("[ERROR] Cover.GetStatus falló: " + error_message);
-        return;
-      }
-
-      var currentPos = result.current_pos;
-
-      // current_pos puede ser null si la persiana se está moviendo o no está calibrada
-      if (currentPos === null || currentPos === undefined) {
-        print("[AVISO] current_pos no disponible.");
-        return;
-      }
-
-      print("[INFO] Posición actual: " + currentPos + "% | Objetivo: " + targetPos + "%");
-
-      var diff = Math.abs(targetPos - currentPos);
-      if (diff <= POSITION_TOLERANCE) {
-        print("[INFO] Ya está dentro de la tolerancia. No se mueve.");
-        return;
-      }
-
-      // Solo abrir más, nunca cerrar
-      if (targetPos <= currentPos) {
-        print("[INFO] Objetivo ≤ posición actual. Se omite para no cerrar.");
-        return;
-      }
-
-      print("[ACCIÓN] Moviendo persiana a " + targetPos + "%");
-      Shelly.call(
-        "Cover.GoToPosition",
-        { id: COVER_ID, pos: targetPos },
-        function(res, err_code, err_msg) {
-          if (err_code !== 0) {
-            print("[ERROR] Cover.GoToPosition falló: " + err_msg);
-          } else {
-            print("[OK] Persiana moviéndose a " + targetPos + "%");
-          }
-        }
-      );
-    }
-  );
-}
-
-// Ciclo principal, se ejecuta cada 15 minutos
 function tick() {
-  Shelly.call(
-    "Sys.GetStatus",
-    {},
-    function(result, error_code, error_message) {
+  var now = nowMinutes();
 
-      if (error_code !== 0 || !result) {
-        print("[ERROR] Sys.GetStatus falló: " + error_message);
-        return;
-      }
-
-      // result.time llega como string "HH:MM" en hora local del dispositivo.
-      // Se usa parseInt (no JSON.parse) porque "08", "05", etc. no son JSON válido.
-      var timeStr  = result.time; // ej. "08:15"
-      var colonIdx = timeStr.indexOf(":");
-      var hours    = parseInt(timeStr.substring(0, colonIdx), 10);
-      var mins     = parseInt(timeStr.substring(colonIdx + 1), 10);
-      var nowMin   = toMinutes(hours, mins);
-
-      print("[TICK] Hora local: " + timeStr + " (" + nowMin + " min desde medianoche)");
-
-      Shelly.call(
-        "Cover.GetStatus",
-        { id: COVER_ID },
-        function(coverResult, coverErr, coverErrMsg) {
-
-          if (coverErr !== 0 || !coverResult) {
-            print("[ERROR] Cover.GetStatus (tick) falló: " + coverErrMsg);
-            return;
-          }
-
-          var currentPos = coverResult.current_pos;
-
-          if (currentPos === null || currentPos === undefined) {
-            print("[AVISO] current_pos no disponible en tick.");
-            return;
-          }
-
-          var targetPos = getTargetPosition(nowMin, currentPos);
-
-          if (targetPos < 0) {
-            print("[INFO] Fuera de las ventanas activas. Sin acción.");
-            if (win1StartCaptured && nowMin < toMinutes(WIN1_START_HOUR, WIN1_START_MIN)) {
-              setWin1Captured(false); // reset nocturno para mañana
-            }
-            return;
-          }
-
-          moveCoverTo(targetPos);
-        }
-      );
-    }
-  );
-}
-
-// --- Arranque: cargar estado persistido antes de empezar a sondear ---------
-
-Shelly.call("KVS.Get", { key: KVS_KEY }, function(res, err_code) {
-  if (err_code === 0 && res && res.value) {
-    var state = JSON.parse(res.value);
-    win1StartCaptured = !!state.captured;
-    win1StartPos      = (typeof state.startPos === "number") ? state.startPos : -1;
-    if (win1StartCaptured) {
-      print("[INICIO] Estado restaurado: Ventana 1 ya capturada en " + win1StartPos + "%");
-    } else {
-      print("[INICIO] Estado restaurado: Ventana 1 sin capturar.");
-    }
-  } else {
-    print("[INICIO] Sin estado previo. Se capturará al entrar en la Ventana 1.");
+  if (now < 0) {
+    print("Persiana: reloj no sincronizado, se omite el ciclo.");
+    return;
   }
 
-  print("[INICIO] Script de posicionamiento gradual cargado.");
-  print("[INICIO] Ventana 1: 08:00–13:00 → hasta 30%");
-  print("[INICIO] Ventana 2: 13:00–21:30 → hasta 75%");
-  print("[INICIO] Intervalo de chequeo: 15 min.");
+  print("Persiana: ciclo a " + now + " min (" +
+        Math.floor(now / 60) + ":" +
+        (now % 60 < 10 ? "0" : "") + (now % 60) + ")");
 
-  tick(); // ejecuta de inmediato, sin esperar los primeros 15 min
-  Timer.set(CHECK_INTERVAL_MS, true, tick);
-});
+  resolveState(now, function (morningPos, cov) {
+    applyPosition(now, morningPos, cov);
+  });
+}
+
+print("Script de persiana iniciado.");
+tick();
+Timer.set(CHECK_INTERVAL_MS, true, tick);

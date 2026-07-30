@@ -1,0 +1,244 @@
+// =============================================================================
+// Shelly 1 Mini Gen4 - Secuencia de Relé Temporizada
+// =============================================================================
+//
+// FUNCIONAMIENTO:
+//   Al cargar el script se crean automáticamente dos horarios (CRON) en el dispositivo:
+//     • Entre semana (Lun-Vie) a las 05:35  → CRON: "0 35 5 * * 1,2,3,4,5"
+//     • Fin de semana (Sáb-Dom) a las 08:30 → CRON: "0 30 8 * * 6,0"
+//   Cada horario llama a startSequence() mediante Script.Eval.
+//
+// SECUENCIA DEL RELÉ (~123.5 s antes del encendido final):
+//   Paso 1: ON 1s   → OFF 0.5s
+//   Paso 2: ON 2s   → OFF 0.5s
+//   Paso 3: ON 4s   → OFF 0.5s
+//   Paso 4: ON 8s   → OFF 0.5s
+//   Paso 5: ON 16s  → OFF 0.5s
+//   Paso 6: ON 32s  → OFF 0.5s
+//   Paso 7: ON 60s  → OFF 0.5s
+//   Paso 8: ON indefinido ✓
+//
+// ALTERNATIVA: CONFIGURACIÓN MANUAL DESDE LA INTERFAZ WEB ───────────────────
+//   1. Abrir http://<ip-del-dispositivo> → pestaña "Schedules"
+//   2. "Add Schedule" → modo "CRON"
+//   3. Entre semana → CRON: 0 35 5 * * 1,2,3,4,5 → Script → Eval → startSequence();
+//   4. Fin de semana → CRON: 0 30 8 * * 6,0      → Script → Eval → startSequence();
+//   Luego poner CREATE_SCHEDULES = false para evitar la creación automática.
+// =============================================================================
+
+
+// ── CONFIGURACIÓN ────────────────────────────────────────────────────────────
+
+var RELAY_ID         = 0;     // Shelly 1 Mini Gen4 tiene un solo relé → ID 0
+var OFF_PAUSE_MS     = 500;   // Pausa entre pasos (ms)
+
+// Poner en false tras la primera ejecución exitosa para evitar duplicados.
+// Los horarios persisten en el dispositivo y sobreviven a reinicios.
+var CREATE_SCHEDULES = true;
+
+var CRON_WEEKDAYS = "0 35 5 * * 1,2,3,4,5"; // Lun-Vie 05:35
+var CRON_WEEKENDS = "0 30 8 * * 6,0";        // Sáb-Dom 08:30 (0 = domingo)
+
+// Lista de horarios a crear (evita duplicar la lógica de creación)
+var SCHEDULES = [
+  { cron: CRON_WEEKDAYS, label: "Entre semana 05:35 (Lun-Vie)" },
+  { cron: CRON_WEEKENDS, label: "Fin de semana 08:30 (Sáb-Dom)" }
+];
+
+// Duraciones ON en milisegundos (OFF_PAUSE_MS se añade después de cada una)
+var SEQUENCE = [1000, 2000, 4000, 8000, 16000, 32000, 60000];
+
+
+// ── ESTADO ────────────────────────────────────────────────────────────────────
+
+var sequenceRunning = false;
+var activeTimer     = null;
+
+
+// ── CONTROL DEL RELÉ ──────────────────────────────────────────────────────────
+
+/**
+ * setRelay(on)
+ * Enciende (true) o apaga (false) el relé mediante la API RPC de Shelly.
+ * No bloqueante — usa un callback para registrar errores.
+ */
+function setRelay(on) {
+  Shelly.call(
+    "Switch.Set",
+    { id: RELAY_ID, on: on },
+    function(result, error_code, error_message) {
+      if (error_code !== 0) {
+        print("ERROR Switch.Set →", error_code, error_message);
+      }
+    }
+  );
+}
+
+
+// ── MOTOR DE SECUENCIA ────────────────────────────────────────────────────────
+
+/**
+ * runStep(stepIndex)
+ * Ejecuta un paso de la secuencia y programa el siguiente.
+ * No bloqueante — usa Timer.set anidados (sin loops ni sleep).
+ */
+function runStep(stepIndex) {
+  // ── Secuencia terminada → relé ON permanente ─────────────────────────────
+  if (stepIndex >= SEQUENCE.length) {
+    print("--- Secuencia completa: relé ON indefinidamente ---");
+    setRelay(true);
+    sequenceRunning = false;
+    activeTimer     = null;
+    return;
+  }
+
+  var onDuration = SEQUENCE[stepIndex];
+  var stepNum    = stepIndex + 1;
+  var totalSteps = SEQUENCE.length;
+
+  print("Paso " + stepNum + "/" + totalSteps + " → ON " + (onDuration / 1000) + "s");
+  setRelay(true);
+
+  activeTimer = Timer.set(onDuration, false, function() {
+
+    print("Paso " + stepNum + "/" + totalSteps + " → OFF " + OFF_PAUSE_MS + "ms");
+    setRelay(false);
+
+    activeTimer = Timer.set(OFF_PAUSE_MS, false, function() {
+      runStep(stepIndex + 1);
+    });
+
+  });
+}
+
+/**
+ * startSequence()
+ * Punto de entrada público. Llamado por los horarios CRON vía Script.Eval.
+ * Evita ejecuciones concurrentes si ya hay una secuencia en marcha.
+ */
+function startSequence() {
+  if (sequenceRunning) {
+    print("AVISO: la secuencia ya está en marcha — se ignora la llamada duplicada.");
+    return;
+  }
+
+  if (activeTimer !== null) {
+    Timer.clear(activeTimer);
+    activeTimer = null;
+  }
+
+  sequenceRunning = true;
+  print("=== Secuencia de relé iniciada ===");
+  runStep(0);
+}
+
+/**
+ * stopSequence()   [NUEVO]
+ * Cancela una secuencia en marcha y apaga el relé de inmediato.
+ * Útil para invocarla manualmente desde la app, un botón o KVS/Webhook.
+ */
+function stopSequence() {
+  if (!sequenceRunning) {
+    print("AVISO: no hay ninguna secuencia en marcha.");
+    return;
+  }
+
+  if (activeTimer !== null) {
+    Timer.clear(activeTimer);
+    activeTimer = null;
+  }
+
+  sequenceRunning = false;
+  setRelay(false);
+  print("=== Secuencia detenida manualmente ===");
+}
+
+
+// ── CREACIÓN DE HORARIOS ──────────────────────────────────────────────────────
+
+/**
+ * scheduleExists(jobs, cron)
+ * Comprueba si ya existe un horario con el CRON indicado, para evitar
+ * duplicados al reiniciar el script.
+ */
+function scheduleExists(jobs, cron) {
+  for (var i = 0; i < jobs.length; i++) {
+    if (jobs[i].timespec === cron) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * createSchedule(cron, label, scriptId)
+ * Crea un horario CRON persistente que llama a startSequence()
+ * en el contexto de este script vía Script.Eval.
+ */
+function createSchedule(cron, label, scriptId) {
+  Shelly.call(
+    "Schedule.Create",
+    {
+      enable   : true,
+      timespec : cron,
+      calls    : [
+        {
+          method : "Script.Eval",
+          params : { id: scriptId, code: "startSequence();" }
+        }
+      ]
+    },
+    function(result, error_code, error_message) {
+      if (error_code === 0) {
+        print("Horario creado → " + label + " [ID: " + result.id + "]");
+      } else {
+        print("ERROR al crear horario '" + label + "' →", error_code, error_message);
+      }
+    }
+  );
+}
+
+/**
+ * initSchedules()
+ * Lista los horarios existentes y crea los que falten.
+ * Recorre SCHEDULES en vez de repetir código por cada horario.
+ */
+function initSchedules() {
+  var scriptId = Shelly.getCurrentScriptId();
+
+  Shelly.call(
+    "Schedule.List",
+    {},
+    function(result, error_code, error_message) {
+
+      if (error_code !== 0) {
+        print("ERROR al listar horarios →", error_code, error_message);
+        return;
+      }
+
+      var jobs = result.jobs || [];
+
+      for (var i = 0; i < SCHEDULES.length; i++) {
+        var sch = SCHEDULES[i];
+        if (!scheduleExists(jobs, sch.cron)) {
+          createSchedule(sch.cron, sch.label, scriptId);
+        } else {
+          print("El horario ya existe → " + sch.label);
+        }
+      }
+
+    }
+  );
+}
+
+
+// ── PUNTO DE ENTRADA ───────────────────────────────────────────────────────────
+
+print("Script cargado. Motor de secuencia de relé listo.");
+print("Relé:", RELAY_ID, "| Pasos:", SEQUENCE.length, "| Pausa OFF:", OFF_PAUSE_MS + "ms");
+
+if (CREATE_SCHEDULES) {
+  initSchedules();
+} else {
+  print("Creación automática de horarios desactivada (CREATE_SCHEDULES = false).");
+}

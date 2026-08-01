@@ -10,7 +10,7 @@
 // ============================================================
 
 var COVER_ID          = 0;       // ID del componente Cover (normalmente 0)
-var CHECK_INTERVAL_MS = 900000;  // Intervalo de comprobación: 900 000 ms = 15 min
+var CHECK_INTERVAL_MS = 2700000;  // Intervalo de comprobación: 900 000 ms = 45 min
 
 // No hace falta configurar un huso horario manual: el propio
 // dispositivo calcula la hora local (con DST incluido) según la
@@ -24,11 +24,11 @@ var W1_END_M    = 0;
 var W1_POS_FROM = 5;
 var W1_POS_TO   = 40;
 
-// Ventana de tarde/noche  13:00 → 21:30  (abre 40 % → 75 %)
+// Ventana de tarde/noche  13:00 → 21:29  (abre 40 % → 75 %)
 var W2_START_H  = 13;
 var W2_START_M  = 0;
 var W2_END_H    = 21;
-var W2_END_M    = 30;
+var W2_END_M    = 29;
 var W2_POS_FROM = 40;
 var W2_POS_TO   = 75;
 
@@ -185,4 +185,4 @@ function runCheck() {
 
 print("=== Controlador de persiana iniciado ===");
 runCheck();                                     // comprobación inmediata al arrancar
-Timer.set(CHECK_INTERVAL_MS, true, runCheck);   // repetir cada 15 min
+Timer.set(CHECK_INTERVAL_MS, true, runCheck);   // repetir cada 45 min

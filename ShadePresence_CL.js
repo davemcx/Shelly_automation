@@ -1,92 +1,67 @@
 // ============================================================
-// Shelly Shutter Gen3 | Daily Cover Position Schedule
-// Cover component ID : 0
-// Cron format        : "sec min hour dom month dow"
-// Timezone           : uses the device's configured local time
+// Shelly Shutter Gen3 | Horario diario de posición de cortina
+// Formato CRON : "seg min hora dom mes dow"
+// Zona horaria : usa la hora local configurada en el dispositivo
 // ============================================================
 
-// ── Helper: move cover to a RANDOM integer position ─────────
-// min/max are inclusive percentage values (0–100)
-function moveToRandom(min, max) {
-  // Generate a clean whole-integer position within [min, max]
+var COVER_ID = 0; // ID del componente Cover (0 = única cortina)
+
+// ── Función base: mueve la cortina a una posición y registra el resultado ──
+function moveTo(pos, description) {
+  console.log("Movimiento programado | " + description);
+
+  Shelly.call(
+    "Cover.GoTo",
+    { id: COVER_ID, pos: pos },
+    function (res, err_code, err_msg) {
+      if (err_code !== 0) {
+        console.log("ERROR Cover.GoTo [" + err_code + "]: " + err_msg);
+      } else {
+        console.log("Cover.GoTo " + pos + "% → aceptado");
+      }
+    }
+  );
+}
+
+// ── Mueve la cortina a una posición ALEATORIA dentro de [min, max] ─────────
+function moveToRandom(min, max, label) {
   var pos = Math.floor(Math.random() * (max - min + 1)) + min;
-
-  console.log(
-    "Scheduled move | range: " + min + "%-" + max +
-    "% | chosen: " + pos + "%"
-  );
-
-  // Call the Gen3 Cover API to move to the calculated position
-  Shelly.call(
-    "Cover.GoTo",
-    { id: 0, pos: pos },          // id:0 = first/only cover component
-    function (res, err_code, err_msg) {
-      if (err_code !== 0) {
-        console.log(
-          "ERROR Cover.GoTo [" + err_code + "]: " + err_msg
-        );
-      } else {
-        console.log("Cover.GoTo " + pos + "% → accepted");
-      }
-    }
-  );
+  moveTo(pos, label + " | rango " + min + "%-" + max + "% | elegido: " + pos + "%");
 }
 
-// ── Helper: move cover to an EXACT position ──────────────────
-function moveToExact(pos) {
-  console.log("Scheduled move | exact: " + pos + "%");
-
-  Shelly.call(
-    "Cover.GoTo",
-    { id: 0, pos: pos },
-    function (res, err_code, err_msg) {
-      if (err_code !== 0) {
-        console.log(
-          "ERROR Cover.GoTo [" + err_code + "]: " + err_msg
-        );
-      } else {
-        console.log("Cover.GoTo " + pos + "% → accepted");
-      }
-    }
-  );
+// ── Mueve la cortina a una posición EXACTA ─────────────────────────────────
+function moveToExact(pos, label) {
+  moveTo(pos, label + " | exacto: " + pos + "%");
 }
 
-// ── 09:00 | Random 6 % – 10 % ───────────────────────────────
-// "0 0 9 * * *"  →  every day at 09:00:00
-Shelly.addCronHandler("0 0 9 * * *", function () {
-  console.log("[09:00] Morning trigger fired");
-  moveToRandom(6, 10);
-});
+// ── Configuración de horarios ────────────────────────────────────────────
+// Añadir, quitar o editar horarios aquí; el resto del script se adapta solo.
+var SCHEDULES = [
+  { cron: "0 0 9 * * *",  label: "09:00 Mañana",   type: "random", min: 6,  max: 10 },
+  { cron: "0 0 12 * * *", label: "12:00 Mediodía", type: "random", min: 11, max: 40 },
+  { cron: "0 0 15 * * *", label: "15:00 Tarde",    type: "random", min: 41, max: 60 },
+  { cron: "0 0 18 * * *", label: "18:00 Noche",    type: "random", min: 60, max: 85 },
+  { cron: "0 0 21 * * *", label: "21:00 Nocturno", type: "exact",  pos: 85 }
+];
 
-// ── 12:00 | Random 11 % – 40 % ──────────────────────────────
-// "0 0 12 * * *"  →  every day at 12:00:00
-Shelly.addCronHandler("0 0 12 * * *", function () {
-  console.log("[12:00] Midday trigger fired");
-  moveToRandom(11, 40);
-});
+// ── Registro de los handlers CRON a partir de la configuración ─────────────
+// Se usa una IIFE para capturar correctamente cada "sch" dentro del loop.
+for (var i = 0; i < SCHEDULES.length; i++) {
+  (function (sch) {
+    Shelly.addCronHandler(sch.cron, function () {
+      console.log("[" + sch.label + "] Disparador activado");
+      if (sch.type === "random") {
+        moveToRandom(sch.min, sch.max, sch.label);
+      } else {
+        moveToExact(sch.pos, sch.label);
+      }
+    });
+  })(SCHEDULES[i]);
+}
 
-// ── 15:00 | Random 41 % – 60 % ──────────────────────────────
-// "0 0 15 * * *"  →  every day at 15:00:00
-Shelly.addCronHandler("0 0 15 * * *", function () {
-  console.log("[15:00] Afternoon trigger fired");
-  moveToRandom(41, 60);
-});
-
-// ── 18:00 | Random 60 % – 85 % ──────────────────────────────
-// "0 0 18 * * *"  →  every day at 18:00:00
-Shelly.addCronHandler("0 0 18 * * *", function () {
-  console.log("[18:00] Evening trigger fired");
-  moveToRandom(60, 85);
-});
-
-// ── 21:00 | Exact 85 % ──────────────────────────────────────
-// "0 0 21 * * *"  →  every day at 21:00:00
-Shelly.addCronHandler("0 0 21 * * *", function () {
-  console.log("[21:00] Night trigger fired");
-  moveToExact(85);
-});
-
-// ── Startup confirmation ─────────────────────────────────────
-console.log(
-  "Cover schedule loaded | handlers: 09:00 / 12:00 / 15:00 / 18:00 / 21:00"
-);
+// ── Confirmación de arranque (lista los horarios cargados dinámicamente) ──
+var loadedLabels = [];
+for (var j = 0; j < SCHEDULES.length; j++) {
+  loadedLabels.push(SCHEDULES[j].label);
+}
+console.log("Horario de cortina cargado | handlers: " + loadedLabels.join(" / "));

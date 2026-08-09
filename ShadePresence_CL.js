@@ -1,54 +1,36 @@
 // ============================================================
-// SHELLY SHUTTER — CONTROLADOR DE PERSIANA ENROLLABLE (ALEATORIO)
+// SHELLY SHUTTER — CONTROLADOR DE PERSIANA ENROLLABLE
 // Compatible con: Shelly 2.5 / Shelly Plus 2PM (modo Cover)
 // Entorno: intérprete de scripts de Shelly (Espruino modificado
 // desde firmware 1.0; versiones previas usaban mJS)
 // ============================================================
-//
-// A diferencia del script original (que interpolaba linealmente
-// entre dos puntos), este script define 4 HORARIOS FIJOS. Cuando
-// el reloj entra en una franja nueva, se elige UNA posición
-// aleatoria dentro del rango de esa franja y se mantiene fija
-// hasta que empiece la siguiente franja (no se recalcula en cada
-// comprobación, para que la persiana no "tiemble" entre chequeos).
-//
+
 // ============================================================
 // CONFIGURACIÓN — edita estos valores según tu instalación
 // ============================================================
 
 var COVER_ID          = 0;       // ID del componente Cover (normalmente 0)
-var CHECK_INTERVAL_MS = 900000;  // Intervalo de comprobación: 900 000 ms = 15 min
-                                  // (más corto que el original porque aquí no hay
-                                  // interpolación que "suavice" el retraso: cuanto
-                                  // más corto el intervalo, más cerca de la hora
-                                  // exacta se disparará cada franja)
+var CHECK_INTERVAL_MS = 3600000;  // Intervalo de comprobación: 3 600 000 ms = 60 min
 
 // No hace falta configurar un huso horario manual: el propio
 // dispositivo calcula la hora local (con DST incluido) según la
 // zona configurada en Ajustes > Ubicación de la app/web del Shelly.
 
-// Ventana general de actividad del script: fuera de este rango
-// (antes de la hora de inicio o después de la hora de fin) no se
-// hace absolutamente nada, aunque el Timer siga llamando a runCheck.
-var SCHEDULE_START_H = 8;
-var SCHEDULE_START_M = 0;
-var SCHEDULE_END_H   = 21;
-var SCHEDULE_END_M   = 30;
+// Ventana de mañana  08:01 → 13:00  (abre 5 % → 40 %)
+var W1_START_H  = 8;
+var W1_START_M  = 1;
+var W1_END_H    = 13;
+var W1_END_M    = 0;
+var W1_POS_FROM = 5;
+var W1_POS_TO   = 30;
 
-// Franjas horarias: cada una empieza a la hora indicada y dura
-// hasta que comienza la siguiente; la última dura hasta SCHEDULE_END
-// (no hasta medianoche), gracias al límite general de arriba.
-// posMin/posMax = rango del que se sortea la posición aleatoria (%).
-var WINDOWS = [
-  { startH: 8,  startM: 1, posMin: 6,  posMax: 10 },  // 08:01 -> 6-10%
-  { startH: 12, startM: 0, posMin: 10, posMax: 30 },  // 12:00 -> 10-30%
-  { startH: 16, startM: 0, posMin: 30, posMax: 60 },  // 16:00 -> 30-60%
-  { startH: 20, startM: 0, posMin: 60, posMax: 85 }   // 20:00 -> 60-85%
-];
-// Nota: los rangos están definidos de forma creciente y contigua
-// (6-10, 10-30, 30-60, 60-85) para que la regla "solo abrir, nunca
-// cerrar" de más abajo tenga siempre sentido de una franja a la
-// siguiente.
+// Ventana de tarde/noche  13:00 → 21:29  (abre 40 % → 85 %)
+var W2_START_H  = 13;
+var W2_START_M  = 0;
+var W2_END_H    = 21;
+var W2_END_M    = 29;
+var W2_POS_FROM = 30;
+var W2_POS_TO   = 65;
 
 // Tolerancia de movimiento — no mover si el delta es <= este valor (%)
 // Nota: como debe ser >= 0, esta misma comprobación ya implementa
@@ -59,8 +41,7 @@ var TOLERANCE = 1;
 // ESTADO INTERNO — no editar
 // ============================================================
 
-var activeWindow = 0;    // índice (1-4) de la franja activa actualmente; 0 = ninguna
-var windowTarget = -1;   // posición aleatoria ya sorteada para la franja activa
+var morningCleared = false;  // indica si ya se reinició el estado de la mañana hoy
 
 // ============================================================
 // FUNCIONES AUXILIARES
@@ -77,31 +58,14 @@ function localTime() {
   return { h: h, m: m, totalMin: h * 60 + m };
 }
 
-// Entero aleatorio uniforme en [min, max], ambos incluidos.
-function randomInt(min, max) {
-  return Math.floor(min + Math.random() * (max - min + 1));
-}
-
 function toMin(h, m) {
   return h * 60 + m;
 }
 
-// Devuelve el índice 1-based (según WINDOWS) de la franja activa
-// para el minuto del día "nowMin", o 0 si aún no ha empezado
-// ninguna franja (por ejemplo, antes de las 08:01).
-function findActiveWindow(nowMin) {
-  var idx = 0;
-  for (var i = 0; i < WINDOWS.length; i++) {
-    var startMin = WINDOWS[i].startH * 60 + WINDOWS[i].startM;
-    if (nowMin >= startMin) {
-      idx = i + 1; // las franjas posteriores sobreescriben a las anteriores
-    }
-  }
-  return idx;
-}
-
-function pad(n) {
-  return (n < 10 ? "0" : "") + n;
+// Interpolación lineal — devuelve un porcentaje entero (redondeado hacia abajo)
+function linearPos(posFrom, posTo, elapsed, total) {
+  if (total <= 0) return posFrom;
+  return Math.floor(posFrom + (posTo - posFrom) * elapsed / total);
 }
 
 // ============================================================
@@ -174,51 +138,51 @@ function runCheck() {
   }
   var now = t.totalMin;
 
-  var scheduleStart = toMin(SCHEDULE_START_H, SCHEDULE_START_M);
-  var scheduleEnd   = toMin(SCHEDULE_END_H,   SCHEDULE_END_M);
+  var w1Start = toMin(W1_START_H, W1_START_M);
+  var w1End   = toMin(W1_END_H,   W1_END_M);
+  var w2Start = toMin(W2_START_H, W2_START_M);
+  var w2End   = toMin(W2_END_H,   W2_END_M);
 
-  // ── Fuera de la ventana general de actividad (antes de 08:00 o desde 21:30) ──
-  if (now < scheduleStart || now >= scheduleEnd) {
-    if (activeWindow !== 0) {
-      print("Fin de la ventana de actividad - estado reiniciado para mañana.");
+  var target  = -1;
+  var elapsed = 0;
+  var total   = 0;
+
+  // ── Ventana de mañana ───────────────────────────────────
+  if (now >= w1Start && now < w1End) {
+    morningCleared = false;   // seguimos dentro de la ventana AM
+    elapsed = now - w1Start;
+    total   = w1End - w1Start;
+    target  = linearPos(W1_POS_FROM, W1_POS_TO, elapsed, total);
+    print("MAÑANA " + t.h + ":" + (t.m < 10 ? "0" : "") + t.m + "  destino=" + target + "%");
+
+  // ── Ventana de tarde/noche ──────────────────────────────
+  } else if (now >= w2Start && now < w2End) {
+    if (!morningCleared) {
+      morningCleared = true;
+      print("Estado de mañana reiniciado - listo para el día siguiente.");
     }
-    activeWindow = 0;
-    windowTarget = -1;
-    print("Script inactivo (" + t.h + ":" + pad(t.m) + ", fuera de 08:00-21:30). Sin acción.");
+    elapsed = now - w2Start;
+    total   = w2End - w2Start;
+    target  = linearPos(W2_POS_FROM, W2_POS_TO, elapsed, total);
+    print("TARDE " + t.h + ":" + (t.m < 10 ? "0" : "") + t.m + "  destino=" + target + "%");
+
+  // ── Fuera del horario activo ────────────────────────────
+  } else {
+    if (now >= w2End && morningCleared) {
+      morningCleared = false;
+      print("Fin de la ventana de tarde - estado listo para mañana.");
+    }
+    print("Fuera de horario (" + t.h + ":" + (t.m < 10 ? "0" : "") + t.m + "). Sin acción.");
     return;
   }
 
-  var idx = findActiveWindow(now);
-
-  // ── Dentro de la ventana general pero antes de que empiece la 1ª franja (08:00-08:01) ──
-  if (idx === 0) {
-    if (activeWindow !== 0) {
-      print("Fuera de todas las franjas - estado reiniciado para mañana.");
-    }
-    activeWindow = 0;
-    windowTarget = -1;
-    print("Fuera de horario (" + t.h + ":" + pad(t.m) + "). Sin acción.");
-    return;
-  }
-
-  // ── Si acabamos de entrar en una franja nueva, sortear su posición ──
-  if (idx !== activeWindow) {
-    activeWindow = idx;
-    var w = WINDOWS[idx - 1];
-    windowTarget = randomInt(w.posMin, w.posMax);
-    print("Nueva franja " + idx + " (desde " + w.startH + ":" + pad(w.startM) +
-          ") - posición aleatoria sorteada: " + windowTarget + "% (rango " +
-          w.posMin + "-" + w.posMax + "%)");
-  }
-
-  print(t.h + ":" + pad(t.m) + "  franja=" + activeWindow + "  destino=" + windowTarget + "%");
-  evaluateAndMove(windowTarget);
+  evaluateAndMove(target);
 }
 
 // ============================================================
 // PUNTO DE ENTRADA
 // ============================================================
 
-print("=== Controlador de persiana (posiciones aleatorias) iniciado ===");
+print("=== Controlador de persiana iniciado ===");
 runCheck();                                     // comprobación inmediata al arrancar
-Timer.set(CHECK_INTERVAL_MS, true, runCheck);   // repetir cada 15 min
+Timer.set(CHECK_INTERVAL_MS, true, runCheck);   // repetir cada 60 min

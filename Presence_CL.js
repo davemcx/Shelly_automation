@@ -26,7 +26,7 @@ var LIGHTS = [
 ];
 
 // Duraciones permitidas de encendido (minutos). Se elige una al azar en cada ciclo.
-var DURATIONS_MIN = [7, 9, 11, 13];
+var DURATIONS_MIN = [7, 9, 11, 13, 15, 17, 19];
 
 // Franjas horarias activas  [horaInicio, minInicio, horaFin, minFin]
 // Las horas se evalúan contra la zona horaria local configurada en el dispositivo.

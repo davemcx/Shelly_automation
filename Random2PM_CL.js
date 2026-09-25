@@ -6,6 +6,7 @@
 var INTERVALS    = [2, 4, 6, 8, 9, 11, 13, 15]; // minutos
 var TIME_START_H = 21, TIME_START_M = 5;
 var TIME_END_H   = 23, TIME_END_M   = 0;
+var OVERLAP_SEC  = 2;
 
 // ---- Estado en tiempo de ejecución ----
 var intervals    = [];   // copia mezclada de INTERVALS
@@ -13,6 +14,9 @@ var step         = 0;    // índice del paso actual
 var curSw        = -1;   // switch activo (0 o 1)
 var overlapTimer = -1;
 var mainTimer    = -1;
+var sequenceActive = false;
+var sequenceStartedToday = false;
+var ownScriptComponent = "script:" + Shelly.getCurrentScriptId();
 
 // ============================================================
 //  Funciones auxiliares
@@ -49,6 +53,36 @@ function pad2(n) {
   return (n < 10) ? "0" + n : "" + n;
 }
 
+// Segundos desde medianoche local; null si la hora aún no está disponible.
+function localSeconds() {
+  var sys = Shelly.getComponentStatus("sys");
+  if (!sys || typeof sys.time !== "string") return null;
+  var colon = sys.time.indexOf(":");
+  if (colon < 1) return null;
+  var h = parseInt(sys.time.slice(0, colon), 10);
+  var m = parseInt(sys.time.slice(colon + 1, colon + 3), 10);
+  if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  var sec = (typeof sys.unixtime === "number" && sys.unixtime > 0) ? sys.unixtime % 60 : 0;
+  return h * 3600 + m * 60 + sec;
+}
+
+function secondsRemaining() {
+  var now = localSeconds();
+  var start = (TIME_START_H * 60 + TIME_START_M) * 60;
+  var end = (TIME_END_H * 60 + TIME_END_M) * 60;
+  if (now === null || now < start || now >= end) return 0;
+  return end - now;
+}
+
+function setSwitch(id, on) {
+  Shelly.call("Switch.Set", { id: id, on: on }, function (res, code, msg) {
+    if (code !== 0) {
+      print("ERROR Switch.Set switch " + id + " " + (on ? "ON" : "OFF") +
+            " (" + code + "): " + msg);
+    }
+  });
+}
+
 // ============================================================
 //  Limpieza — cancela timers y apaga ambos switches
 // ============================================================
@@ -56,8 +90,9 @@ function cleanup() {
   print("[LIMPIEZA] Cancelando timers y apagando ambas salidas.");
   if (overlapTimer !== -1) { Timer.clear(overlapTimer); overlapTimer = -1; }
   if (mainTimer    !== -1) { Timer.clear(mainTimer);    mainTimer    = -1; }
-  Shelly.call("Switch.Set", {id: 0, on: false}, null);
-  Shelly.call("Switch.Set", {id: 1, on: false}, null);
+  setSwitch(0, false);
+  setSwitch(1, false);
+  sequenceActive = false;
 }
 
 // ============================================================
@@ -65,12 +100,22 @@ function cleanup() {
 // ============================================================
 function runStep() {
 
-  if (step >= intervals.length) {
-    print("=== Secuencia completa. Los " + intervals.length + " pasos terminaron. ===");
+  var remaining = secondsRemaining();
+  if (remaining <= 0) {
+    print("Fin de la ventana horaria. Apagando ambas salidas.");
+    cleanup();
     return;
   }
 
-  var durSec = intervals[step] * 60;   // minutos → segundos
+  if (step >= intervals.length) {
+    print("=== Secuencia completa. Los " + intervals.length + " pasos terminaron. ===");
+    cleanup();
+    return;
+  }
+
+  var plannedSec = intervals[step] * 60;
+  var durSec = Math.min(plannedSec, remaining); // no cruzar el cierre
+  var truncated = durSec < plannedSec;
   var sw     = curSw;                  // snapshot para el closure
   var nSw    = otherSw(sw);            // siguiente switch
   var isLast = (step === intervals.length - 1);
@@ -82,16 +127,21 @@ function runStep() {
     (isLast ? " [ÚLTIMO PASO]" : " | Siguiente: Switch " + nSw)
   );
 
-  Shelly.call("Switch.Set", {id: sw, on: true}, null);
+  setSwitch(sw, true);
 
-  if (!isLast) {
+  if (!isLast && !truncated && durSec > OVERLAP_SEC) {
     // ---- Timer de solapamiento: dispara 2s antes del final ----
     overlapTimer = Timer.set(
-      (durSec - 2) * 1000,
+      (durSec - OVERLAP_SEC) * 1000,
       false,
       function() {
+        overlapTimer = -1;
+        if (secondsRemaining() <= 0) {
+          cleanup();
+          return;
+        }
         print("[SOLAPAMIENTO] Switch " + nSw + " ON — ambos switches activos por 2 segundos.");
-        Shelly.call("Switch.Set", {id: nSw, on: true}, null);
+        setSwitch(nSw, true);
       }
     );
 
@@ -100,22 +150,37 @@ function runStep() {
       durSec * 1000,
       false,
       function() {
+        mainTimer = -1;
+        if (truncated || secondsRemaining() <= 0) {
+          print("Fin de la ventana horaria. Apagando ambas salidas.");
+          cleanup();
+          return;
+        }
         print("[RELEVO] Switch " + sw + " OFF — Switch " + nSw + " continúa.");
-        Shelly.call("Switch.Set", {id: sw, on: false}, null);
+        setSwitch(sw, false);
         curSw = nSw;
         step++;
         runStep();
       }
     );
 
+  } else if (!isLast) {
+    // El margen hasta el cierre es menor que el solapamiento: terminar este
+    // paso y apagar ambas salidas al llegar al límite de la ventana.
+    mainTimer = Timer.set(durSec * 1000, false, function() {
+      mainTimer = -1;
+      cleanup();
+    });
   } else {
     // ---- Último paso: sin solapamiento, solo apagar y terminar ----
     mainTimer = Timer.set(
       durSec * 1000,
       false,
       function() {
+        mainTimer = -1;
         print("[FINAL] Switch " + sw + " OFF. Secuencia terminada.");
-        Shelly.call("Switch.Set", {id: sw, on: false}, null);
+        setSwitch(sw, false);
+        sequenceActive = false;
       }
     );
   }
@@ -131,80 +196,54 @@ function runStep() {
 Shelly.addEventHandler(function(event) {
   if (!event) return;
 
-  var isScriptEvent = (
-    typeof event.component === "string" &&
-    event.component.indexOf("script") === 0
-  );
-
-  if (isScriptEvent && event.event === "stopped") {
+  if (event.component === ownScriptComponent && event.event === "stopped") {
     print("Evento externo 'stopped' recibido. Ejecutando limpieza.");
     cleanup();
   }
 });
 
 // ============================================================
-//  Punto de entrada — verifica la hora y arranca la secuencia
+//  Planificador diario — espera a la hora de inicio y reinicia al cierre
 // ============================================================
-function start() {
-  print("=== Script iniciando. Verificando hora del dispositivo... ===");
+function watchdogTick() {
+  var now = localSeconds();
+  if (now === null) {
+    print("Hora local no disponible; se reintentará en el siguiente ciclo.");
+    return;
+  }
 
-  Shelly.call("Sys.GetStatus", {}, function(res, code, msg) {
-
-    if (code !== 0 || !res || !res.time) {
-      print("ERROR: No se pudo leer la hora del dispositivo (code=" + code +
-            ", msg=" + msg + "). Abortando.");
-      return;
+  var start = (TIME_START_H * 60 + TIME_START_M) * 60;
+  var end = (TIME_END_H * 60 + TIME_END_M) * 60;
+  if (now >= end) {
+    if (sequenceActive) {
+      print("Fin de la ventana horaria; apagando las dos salidas.");
+      cleanup();
     }
-
-    var timeStr = res.time;   // "HH:MM" hora local del dispositivo
-    var colon   = timeStr.indexOf(":");
-    if (colon < 0) {
-      print("ERROR: Formato de hora inesperado: '" + timeStr + "'. Abortando.");
-      return;
+    if (sequenceStartedToday) {
+      sequenceStartedToday = false;
+      print("Estado diario reiniciado para la próxima ejecución.");
     }
+    return;
+  }
 
-    // Parsear HH y MM manualmente
-    var hStr = timeStr.substring(0, colon);
-    var mStr = timeStr.substring(colon + 1, colon + 3);
-    var h = 0, m = 0, i;
-    for (i = 0; i < hStr.length; i++) h = h * 10 + (hStr.charCodeAt(i) - 48);
-    for (i = 0; i < mStr.length; i++) m = m * 10 + (mStr.charCodeAt(i) - 48);
+  if (now < start || sequenceStartedToday) return;
 
-    var nowMin   = h * 60 + m;
-    var startMin = TIME_START_H * 60 + TIME_START_M;
-    var endMin   = TIME_END_H   * 60 + TIME_END_M;
+  print("Ventana activa. Preparando la secuencia diaria...");
+  intervals = [];
+  for (var k = 0; k < INTERVALS.length; k++) intervals.push(INTERVALS[k]);
+  shuffle(intervals);
+  print("Intervalos mezclados: " + arrToStr(intervals) + " (minutos)");
 
-    print(
-      "Hora del dispositivo: " + timeStr +
-      " | Ventana permitida: " +
-      pad2(TIME_START_H) + ":" + pad2(TIME_START_M) +
-      " – " +
-      pad2(TIME_END_H)   + ":" + pad2(TIME_END_M)
-    );
-
-    if (nowMin < startMin || nowMin >= endMin) {
-      print("Fuera de la ventana horaria permitida (" + timeStr + "). Script abortado.");
-      return;
-    }
-
-    print("Verificación de hora OK. Preparando secuencia...");
-
-    // ---- Construir y mezclar una copia nueva de INTERVALS ----
-    intervals = [];
-    for (var k = 0; k < INTERVALS.length; k++) {
-      intervals.push(INTERVALS[k]);
-    }
-    shuffle(intervals);
-    print("Intervalos mezclados: " + arrToStr(intervals) + " (minutos)");
-
-    // ---- Inicializar estado y arrancar el primer paso ----
-    step  = 0;
-    curSw = 1;    // la secuencia empieza con el Switch 1
-    print("Iniciando con Switch " + curSw + ".");
-    runStep();
-  });
+  step = 0;
+  curSw = 1;
+  sequenceStartedToday = true;
+  sequenceActive = true;
+  print("Iniciando con Switch " + curSw + ".");
+  runStep();
 }
 
 // ============================================================
-start();
-// ============================================================
+print("Script Shelly listo; comprobación diaria cada minuto.");
+watchdogTick();
+Timer.set(60 * 1000, true, watchdogTick);
+// ========================================================

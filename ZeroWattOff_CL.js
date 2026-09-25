@@ -2,10 +2,10 @@
 var SWITCH_ID           = 0;        // id del interruptor a controlar
 var ZERO_DURATION_S      = 55;      // segundos en 0W antes de actuar
 var OFF_DURATION_S       = 5 * 60;  // segundos que el enchufe permanece OFF (5 min)
-var COOLDOWN_S           = 144 * 3600; // segundos entre acciones permitidas (144 h)
+var COOLDOWN_S           = 168 * 3600; // segundos entre acciones permitidas (168 h = 7 d)
 var POWER_THRESHOLD_W    = 0.5;     // potencia por debajo de la cual se considera "0W" (ruido del medidor)
 var KVS_KEY              = "plug_last_action_state";
-var CHECK_INTERVAL_S     = 5;       // intervalo de sondeo en segundos
+var CHECK_INTERVAL_S     = 10;       // intervalo de sondeo en segundos
 var MAX_RESTORE_RETRIES  = 8;       // reintentos máximos al restaurar el ON
 // ────────────────────────────────────────────────────────────────
 
@@ -14,6 +14,7 @@ var lastActionTs   = 0;      // ts unix de la última acción de apagado
 var restoreAt      = 0;      // ts unix en el que se debe restaurar el ON
 var actionPending  = false;  // true mientras el enchufe está OFF o volviendo a ON
 var restoreRetries = 0;      // contador de reintentos de restauración
+var restoreRecoveryPending = false; // reanudar tras sincronizar el reloj
 
 // ── Utilidades ───────────────────────────────────────────────
 
@@ -40,9 +41,17 @@ function saveState(cb) {
 // ── Lógica principal ─────────────────────────────────────────
 
 function checkPower() {
+  if (restoreRecoveryPending) {
+    resumeRestore();
+    if (restoreRecoveryPending || actionPending) return;
+  }
   if (actionPending) return;
 
   var t = now();
+  if (t <= 0) {
+    zeroSince = null;
+    return;
+  }
 
   // Respeta el cooldown de COOLDOWN_S
   if (t > 0 && t - lastActionTs < COOLDOWN_S) {
@@ -95,7 +104,10 @@ function triggerOff(t) {
     // Solo al confirmar el apagado se registra la acción y el cooldown
     lastActionTs = t;
     restoreAt    = t + OFF_DURATION_S;
-    saveState(function () {
+    saveState(function (saved) {
+      if (!saved) {
+        print("AVISO: no se pudo persistir el estado; un reinicio podría perder la restauración programada.");
+      }
       print("Enchufe apagado. Se restaurará en", OFF_DURATION_S / 60, "min.");
       restoreRetries = 0;
       scheduleRestore(OFF_DURATION_S);
@@ -125,24 +137,50 @@ function scheduleRestore(delaySeconds) {
   });
 }
 
+function resumeRestore() {
+  var t = now();
+  if (t <= 0) return;
+  restoreRecoveryPending = false;
+  if (restoreAt > t) {
+    var remainingOff = restoreAt - t;
+    print("Reanudado durante periodo OFF. Restaurando en", remainingOff, "s.");
+    actionPending = true;
+    Shelly.call("Switch.Set", { id: SWITCH_ID, on: false }, function (res, code, msg) {
+      if (code !== 0) print("Aviso al reanudar OFF:", msg);
+      scheduleRestore(remainingOff);
+    });
+  } else {
+    print("Periodo OFF vencido mientras el reloj no estaba disponible; restaurando ahora.");
+    actionPending = true;
+    scheduleRestore(0);
+  }
+}
+
 // ── Arranque: cargar estado persistido y comenzar el sondeo ────
 
 Shelly.call("KVS.Get", { key: KVS_KEY }, function (res, err_code) {
   if (err_code === 0 && res && res.value) {
-    var state = JSON.parse(res.value);
-    lastActionTs = state.lastActionTs || 0;
-    restoreAt    = state.restoreAt || 0;
+    var state = null;
+    try {
+      state = JSON.parse(res.value);
+    } catch (e) {
+      print("Estado KVS inválido; se iniciará sin estado previo.");
+    }
+    if (state && typeof state === "object") {
+      if (typeof state.lastActionTs === "number" && state.lastActionTs > 0) lastActionTs = state.lastActionTs;
+      if (typeof state.restoreAt === "number" && state.restoreAt > 0) restoreAt = state.restoreAt;
+    }
 
     var t = now();
 
-    // Si el enchufe debía seguir apagado (reinicio a mitad del OFF_DURATION_S)
-    if (restoreAt > t) {
-      var remainingOff = restoreAt - t;
-      print("Reanudado durante periodo OFF. Restaurando en", remainingOff, "s.");
-      actionPending = true;
-      Shelly.call("Switch.Set", { id: SWITCH_ID, on: false }, function () {
-        scheduleRestore(remainingOff);
-      });
+    // Reanudar apagado pendiente, incluso si NTP aún no sincronizó el reloj.
+    if (restoreAt > 0) {
+      if (t > 0) resumeRestore();
+      else {
+        restoreRecoveryPending = true;
+        actionPending = true;
+        print("Reloj sin sincronizar; la restauración pendiente se reanudará al sincronizarse.");
+      }
     } else {
       var diff = t - lastActionTs;
       if (diff < COOLDOWN_S) {

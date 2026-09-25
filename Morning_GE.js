@@ -7,7 +7,7 @@
 var RELAY_ID        = 0;     // Shelly 1 Mini Gen4 tiene un relé (ID 0)
 var OFF_PAUSE_MS    = 500;   // Pausa de medio segundo entre encendidos (ms)
 
-// Cambia esto a 'false' tras la primera ejecución exitosa para evitar duplicar horarios.
+// Puede permanecer en true: el script comprueba si ya existen sus propios horarios.
 // Los horarios se guardan en el dispositivo y sobreviven a los reinicios.
 var CREATE_SCHEDULES = true;
 
@@ -27,7 +27,7 @@ var activeTimer     = null;
 
 // ── CONTROL DE RELÉ ───────────────────────────────────────────────────────────
 
-function setRelay(on) {
+function setRelay(on, callback) {
   Shelly.call(
     "Switch.Set",
     { id: RELAY_ID, on: on },
@@ -35,6 +35,7 @@ function setRelay(on) {
       if (error_code !== 0) {
         print("ERROR Switch.Set →", error_code, error_message);
       }
+      if (callback) callback(error_code === 0);
     }
   );
 }
@@ -59,19 +60,30 @@ function runStep(stepIndex) {
   print("Paso " + stepNum + "/" + totalSteps + " → ON por " + (onDuration / 1000) + "s");
   
   // 1. Encender el relé
-  setRelay(true);
+  setRelay(true, function(ok) {
+    if (!ok) {
+      sequenceRunning = false;
+      setRelay(false);
+      print("Secuencia abortada: no se pudo encender el relé.");
+      return;
+    }
 
-  // 2. Programar apagado según el tiempo del paso actual
-  activeTimer = Timer.set(onDuration, false, function() {
-
-    print("Paso " + stepNum + "/" + totalSteps + " → OFF por " + OFF_PAUSE_MS + "ms");
-    setRelay(false);
-
-    // 3. Programar el siguiente paso tras la pausa de medio segundo
-    activeTimer = Timer.set(OFF_PAUSE_MS, false, function() {
-      runStep(stepIndex + 1);
+    // Programar apagado solo después de confirmar el encendido.
+    activeTimer = Timer.set(onDuration, false, function() {
+      activeTimer = null;
+      print("Paso " + stepNum + "/" + totalSteps + " → OFF por " + OFF_PAUSE_MS + "ms");
+      setRelay(false, function(offOk) {
+        if (!offOk) {
+          sequenceRunning = false;
+          print("Secuencia abortada: no se pudo apagar el relé.");
+          return;
+        }
+        activeTimer = Timer.set(OFF_PAUSE_MS, false, function() {
+          activeTimer = null;
+          runStep(stepIndex + 1);
+        });
+      });
     });
-
   });
 }
 
@@ -96,10 +108,15 @@ function startSequence() {
 
 // ── CREACIÓN AUTOMÁTICA DE HORARIOS ───────────────────────────────────────────
 
-function scheduleExists(jobs, cron) {
+function scheduleExists(jobs, cron, scriptId) {
   for (var i = 0; i < jobs.length; i++) {
-    if (jobs[i].timespec === cron) {
-      return true;
+    if (jobs[i].timespec !== cron || !jobs[i].calls) continue;
+    for (var j = 0; j < jobs[i].calls.length; j++) {
+      var call = jobs[i].calls[j];
+      if (call.method === "Script.Eval" && call.params &&
+          call.params.id === scriptId && call.params.code === "startSequence();") {
+        return true;
+      }
     }
   }
   return false;
@@ -146,14 +163,14 @@ function initSchedules() {
       var jobs = result.jobs || [];
 
       // Horario de Lunes a Viernes
-      if (!scheduleExists(jobs, CRON_WEEKDAYS)) {
+      if (!scheduleExists(jobs, CRON_WEEKDAYS, scriptId)) {
         createSchedule(CRON_WEEKDAYS, "Lunes a Viernes 05:35", scriptId);
       } else {
         print("El horario ya existe → Lunes a Viernes 05:35");
       }
 
       // Horario de Fines de Semana
-      if (!scheduleExists(jobs, CRON_WEEKENDS)) {
+      if (!scheduleExists(jobs, CRON_WEEKENDS, scriptId)) {
         createSchedule(CRON_WEEKENDS, "Fines de semana 08:30", scriptId);
       } else {
         print("El horario ya existe → Fines de semana 08:30");

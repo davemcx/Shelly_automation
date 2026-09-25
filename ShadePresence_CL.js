@@ -1,8 +1,7 @@
 // ============================================================
 // SHELLY SHUTTER — CONTROLADOR DE PERSIANA ENROLLABLE
-// Compatible con: Shelly 2.5 / Shelly Plus 2PM (modo Cover)
-// Entorno: intérprete de scripts de Shelly (Espruino modificado
-// desde firmware 1.0; versiones previas usaban mJS)
+// Requiere un Shelly Gen2+ con scripting y componente Cover (por ejemplo,
+// Shelly Plus 2PM en perfil Cover). Shelly 2.5 Gen1 no ejecuta estos scripts.
 // ============================================================
 
 // ============================================================
@@ -10,7 +9,7 @@
 // ============================================================
 
 var COVER_ID          = 0;       // ID del componente Cover (normalmente 0)
-var CHECK_INTERVAL_MS = 3600000;  // Intervalo de comprobación: 3 600 000 ms = 60 min
+var CHECK_INTERVAL_MS = 60 * 60 * 1000; // 60 minutos
 
 // No hace falta configurar un huso horario manual: el propio
 // dispositivo calcula la hora local (con DST incluido) según la
@@ -24,7 +23,7 @@ var W1_END_M    = 0;
 var W1_POS_FROM = 5;
 var W1_POS_TO   = 30;
 
-// Ventana de tarde/noche  13:00 → 21:29  (abre 40 % → 85 %)
+// Ventana de tarde/noche  13:00 → 21:29  (abre 30 % → 65 %)
 var W2_START_H  = 13;
 var W2_START_M  = 0;
 var W2_END_H    = 21;
@@ -53,8 +52,10 @@ function localTime() {
   var sys = Shelly.getComponentStatus("sys");
   if (!sys || typeof sys.time !== "string") return null;
   var parts = sys.time.split(":");
+  if (parts.length < 2) return null;
   var h = parseInt(parts[0], 10);
   var m = parseInt(parts[1], 10);
+  if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
   return { h: h, m: m, totalMin: h * 60 + m };
 }
 
@@ -185,4 +186,4 @@ function runCheck() {
 
 print("=== Controlador de persiana iniciado ===");
 runCheck();                                     // comprobación inmediata al arrancar
-Timer.set(CHECK_INTERVAL_MS, true, runCheck);   // repetir cada 60 min
+Timer.set(CHECK_INTERVAL_MS, true, runCheck);   // repetir cada 60 minutos

@@ -23,8 +23,10 @@ var offMin          = INITIAL_OFF_MIN;
 var cycleCount      = 0;
 var currentTimer    = null;
 var maxRuntimeTimer = null;
+var retryTimer      = null;
 var isRunning       = false;
 var isTerminating   = false;
+var ownScriptComponent = "script:" + Shelly.getCurrentScriptId();
 
 // ================================================================
 // 2. UTILIDAD DE LOG
@@ -55,6 +57,10 @@ function terminateScript(reason) {
     Timer.clear(maxRuntimeTimer);
     maxRuntimeTimer = null;
     log("INFO", "Timer de seguridad cancelado.");
+  }
+  if (retryTimer !== null) {
+    Timer.clear(retryTimer);
+    retryTimer = null;
   }
 
   // Medida final: garantizar que el switch quede en OFF
@@ -102,7 +108,8 @@ function callWithRetry(state, retriesLeft, onSuccess, onFailure) {
       );
 
       if (retriesLeft > 0) {
-        Timer.set(500, false, function() {
+        retryTimer = Timer.set(500, false, function() {
+          retryTimer = null;
           callWithRetry(state, retriesLeft - 1, onSuccess, onFailure);
         });
       } else {
@@ -218,12 +225,7 @@ function runCycle() {
 Shelly.addEventHandler(function(event) {
   if (!event) return;
 
-  var isScriptEvent = (
-    typeof event.component === "string" &&
-    event.component.indexOf("script") === 0
-  );
-
-  if (isScriptEvent && event.event === "stopped") {
+  if (event.component === ownScriptComponent && event.event === "stopped") {
     log("INFO", "Evento externo 'stopped' recibido. Cancelando todos los timers.");
 
     if (currentTimer !== null) {
@@ -233,6 +235,10 @@ Shelly.addEventHandler(function(event) {
     if (maxRuntimeTimer !== null) {
       Timer.clear(maxRuntimeTimer);
       maxRuntimeTimer = null;
+    }
+    if (retryTimer !== null) {
+      Timer.clear(retryTimer);
+      retryTimer = null;
     }
   }
 });

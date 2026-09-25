@@ -1,44 +1,62 @@
-// --- Configuración y estado ---
-var BASE_INTERVALS = [2, 4, 6, 8, 9, 11, 13, 15];
-var WIN_START = 21; // 21:00 (9 PM)
-var WIN_END = 23;   // 23:00 (11 PM, exclusivo)
-var SWITCH_ID = 0;
+// Shelly: secuencia aleatoria diaria para un relé.
+// Toda la actividad queda limitada a la ventana horaria configurada.
 
+// ── Configuración ────────────────────────────────────────────────────────────
+var BASE_INTERVALS = [2, 4, 6, 8, 9, 11, 13, 15]; // minutos ON
+var OFF_INTERVALS  = [2, 3];                      // minutos OFF entre fases
+var WIN_START_H     = 21;
+var WIN_START_M     = 0;
+var WIN_END_H       = 23;
+var WIN_END_M       = 0; // exclusivo
+var SWITCH_ID       = 0;
+var WATCHDOG_MS     = 60 * 1000;
+
+// ── Estado ───────────────────────────────────────────────────────────────────
 var shuffledIntervals = [];
 var currentIntervalIndex = -1;
 var isCycleActive = false;
 var cycleCompleteToday = false;
 var activeTimerId = null;
 
-// --- Funciones auxiliares ---
+// Devuelve segundos desde medianoche local; null si el reloj no está listo.
+function getLocalSeconds() {
+  var sys = Shelly.getComponentStatus("sys");
+  if (!sys || typeof sys.time !== "string") return null;
 
-// Fisher-Yates manual, compatible con mJS (sin métodos avanzados de array)
-function shuffleIntervalsArray() {
-  shuffledIntervals = [];
-  for (var i = 0; i < BASE_INTERVALS.length; i++) {
-    shuffledIntervals.push(BASE_INTERVALS[i]);
-  }
+  var colon = sys.time.indexOf(":");
+  if (colon < 1) return null;
+  var hour = parseInt(sys.time.slice(0, colon), 10);
+  var minute = parseInt(sys.time.slice(colon + 1, colon + 3), 10);
+  if (isNaN(hour) || isNaN(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
 
-  for (var j = shuffledIntervals.length - 1; j > 0; j--) {
-    var randIndex = Math.floor(Math.random() * (j + 1));
-    var temp = shuffledIntervals[j];
-    shuffledIntervals[j] = shuffledIntervals[randIndex];
-    shuffledIntervals[randIndex] = temp;
-  }
-  print("Intervalos mezclados para esta noche: ", JSON.stringify(shuffledIntervals));
+  var second = (typeof sys.unixtime === "number" && sys.unixtime > 0) ? sys.unixtime % 60 : 0;
+  return hour * 3600 + minute * 60 + second;
 }
 
-// Enciende/apaga el relé con manejo de error RPC
-function setRelayState(isOn) {
-  Shelly.call(
-    "Switch.Set",
-    { id: SWITCH_ID, on: isOn },
-    function (result, error_code, error_msg) {
-      if (error_code !== 0) {
-        print("Error RPC (" + error_code + "): " + error_msg);
-      }
-    }
-  );
+function windowBounds() {
+  return {
+    start: (WIN_START_H * 60 + WIN_START_M) * 60,
+    end: (WIN_END_H * 60 + WIN_END_M) * 60
+  };
+}
+
+function secondsRemaining() {
+  var now = getLocalSeconds();
+  var bounds = windowBounds();
+  if (now === null || now < bounds.start || now >= bounds.end) return 0;
+  return bounds.end - now;
+}
+
+function shuffleIntervals() {
+  shuffledIntervals = [];
+  for (var i = 0; i < BASE_INTERVALS.length; i++) shuffledIntervals.push(BASE_INTERVALS[i]);
+  for (var j = shuffledIntervals.length - 1; j > 0; j--) {
+    var k = Math.floor(Math.random() * (j + 1));
+    var tmp = shuffledIntervals[j];
+    shuffledIntervals[j] = shuffledIntervals[k];
+    shuffledIntervals[k] = tmp;
+  }
+  print("Intervalos mezclados:", JSON.stringify(shuffledIntervals));
 }
 
 function clearActiveTimer() {
@@ -48,102 +66,105 @@ function clearActiveTimer() {
   }
 }
 
-// Extrae la hora local actual desde el estado del sistema
-function getCurrentHour() {
-  var sysStatus = Shelly.getComponentStatus("sys");
-  if (sysStatus && sysStatus.time) {
-    // Formato esperado "HH:MM"
-    var timeParts = sysStatus.time.split(":");
-    if (timeParts.length >= 1) {
-      return JSON.parse(timeParts[0]);
+function setRelayState(isOn, callback) {
+  Shelly.call("Switch.Set", { id: SWITCH_ID, on: isOn }, function (res, code, msg) {
+    if (code !== 0) {
+      print("ERROR Switch.Set (" + (isOn ? "ON" : "OFF") + "): " + code + " " + msg);
+      if (callback) callback(false);
+      return;
     }
-  }
-  return -1; // Estado de fallo
+    if (callback) callback(true);
+  });
 }
 
-// --- Flujo de ejecución del ciclo ---
+function finishCycle(completed) {
+  clearActiveTimer();
+  setRelayState(false);
+  isCycleActive = false;
+  if (completed) cycleCompleteToday = true;
+}
+
+function abortCycle(reason) {
+  if (reason) print("Ciclo detenido: " + reason);
+  finishCycle(false);
+}
 
 function runNextPhase() {
-  var currentHour = getCurrentHour();
-
-  // Si ya salimos de la ventana horaria, abortar
-  if (currentHour < WIN_START || currentHour >= WIN_END) {
-    print("Se salió de la ventana horaria durante la ejecución. Abortando ciclo.");
-    abortCycle();
+  activeTimerId = null;
+  var remaining = secondsRemaining();
+  if (remaining <= 0) {
+    abortCycle("fin de la ventana horaria o reloj no disponible");
     return;
   }
 
   currentIntervalIndex++;
-
   if (currentIntervalIndex >= shuffledIntervals.length) {
-    print("Todos los intervalos agotados. Ciclo nocturno completo.");
-    setRelayState(false);
-    isCycleActive = false;
-    cycleCompleteToday = true;
+    print("Todas las fases completadas.");
+    finishCycle(true);
     return;
   }
 
-  // Fase 1: Encender relé
-  var onMinutes = shuffledIntervals[currentIntervalIndex];
-  print("Iniciando Fase 1 (ON): Elemento " + currentIntervalIndex + " por " + onMinutes + " minutos.");
-  setRelayState(true);
+  var onSeconds = Math.min(shuffledIntervals[currentIntervalIndex] * 60, remaining);
+  var truncated = onSeconds < shuffledIntervals[currentIntervalIndex] * 60;
+  print("Fase ON " + (currentIntervalIndex + 1) + "/" + shuffledIntervals.length +
+        " por " + onSeconds + " s" + (truncated ? " (hasta el cierre)" : ""));
 
-  clearActiveTimer();
-  activeTimerId = Timer.set(onMinutes * 60 * 1000, false, function () {
-    // Fase 2: Apagar relé (pausa de buffer aleatoria)
-    var currentHourCheck = getCurrentHour();
-    if (currentHourCheck < WIN_START || currentHourCheck >= WIN_END) {
-      abortCycle();
+  setRelayState(true, function (ok) {
+    if (!ok) {
+      abortCycle("falló el encendido del relé");
       return;
     }
+    activeTimerId = Timer.set(onSeconds * 1000, false, function () {
+      activeTimerId = null;
+      if (truncated || secondsRemaining() <= 0) {
+        abortCycle("fin de la ventana horaria");
+        return;
+      }
 
-    // 50% de probabilidad entre 2 o 3 minutos
-    var offMinutes = Math.random() < 0.5 ? 2 : 3;
-    print("Iniciando Fase 2 (buffer OFF): Pausando por " + offMinutes + " minutos.");
-    setRelayState(false);
+      var offSeconds = OFF_INTERVALS[Math.floor(Math.random() * OFF_INTERVALS.length)] * 60;
+      remaining = secondsRemaining();
+      var plannedOffSeconds = offSeconds;
+      offSeconds = Math.min(offSeconds, remaining);
+      var offTruncated = offSeconds < plannedOffSeconds;
 
-    clearActiveTimer();
-    activeTimerId = Timer.set(offMinutes * 60 * 1000, false, function () {
-      runNextPhase(); // Siguiente intervalo ON
+      setRelayState(false, function (offOk) {
+        if (!offOk) {
+          abortCycle("falló el apagado del relé");
+          return;
+        }
+        activeTimerId = Timer.set(offSeconds * 1000, false, function () {
+          activeTimerId = null;
+          if (offTruncated || secondsRemaining() <= 0) {
+            abortCycle("fin de la ventana horaria");
+            return;
+          }
+          runNextPhase();
+        });
+      });
     });
   });
 }
 
-function abortCycle() {
-  clearActiveTimer();
-  setRelayState(false);
-  isCycleActive = false;
-}
-
-// --- Watchdog ---
-
 function watchdogTick() {
-  var hour = getCurrentHour();
-  if (hour === -1) {
-    print("Advertencia: No se pudo obtener la hora del sistema.");
-    return;
-  }
-
-  if (hour >= WIN_START && hour < WIN_END) {
-    if (!isCycleActive && !cycleCompleteToday) {
-      print("Entrando a la ventana horaria. Inicializando ciclo nocturno.");
-      shuffleIntervalsArray();
-      currentIntervalIndex = -1;
-      isCycleActive = true;
-      runNextPhase();
-    }
-  } else {
-    // Fuera de la ventana: reiniciar banderas para el día siguiente
-    if (cycleCompleteToday || isCycleActive) {
-      print("Fuera de la ventana horaria. Reiniciando banderas diarias.");
+  var remaining = secondsRemaining();
+  if (remaining <= 0) {
+    if (isCycleActive || cycleCompleteToday) {
+      print("Fuera de la ventana horaria; reiniciando estado diario.");
       abortCycle();
       cycleCompleteToday = false;
     }
+    return;
+  }
+
+  if (!isCycleActive && !cycleCompleteToday) {
+    print("Ventana activa: iniciando secuencia.");
+    shuffleIntervals();
+    currentIntervalIndex = -1;
+    isCycleActive = true;
+    runNextPhase();
   }
 }
 
-// --- Inicialización ---
-
-print("Script de Ciclo Aleatorio Shelly iniciado.");
-watchdogTick(); // Verificación inmediata al arrancar
-Timer.set(60 * 1000, true, watchdogTick); // Watchdog cada 60 segundos
+print("Controlador de ciclo aleatorio Shelly iniciado.");
+watchdogTick();
+Timer.set(WATCHDOG_MS, true, watchdogTick);

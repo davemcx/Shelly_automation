@@ -42,7 +42,7 @@ var IDLE_CHECK_MS = 60 * 1000;   // 60 000 ms = 1 minuto
 // ----------------------------------------------------------------
 // ESTADO EN TIEMPO DE EJECUCIÓN  (no editar)
 // ----------------------------------------------------------------
-var currentIdx = 0;      // Qué luz sigue en la secuencia (0-2)
+var currentIdx = 0;      // Índice de la próxima luz
 var activeTimer = null;  // Handle del Timer pendiente actual
 var lightsAreOff = true; // Evita reenviar Switch.Set si ya está todo apagado
 
@@ -53,17 +53,12 @@ var lightsAreOff = true; // Evita reenviar Switch.Set si ya está todo apagado
 // Convierte la hora local del sistema Shelly "HH:MM" → minutos desde medianoche.
 // Ejemplo: "21:45" → 1305
 function timeStrToMin(t) {
-  var h = 0;
-  var m = 0;
-  var colon = 0;
-
-  // Busca la posición del ":" manualmente (String.indexOf no existe en todos los builds de mJS)
-  for (var i = 0; i < t.length; i++) {
-    if (t[i] === ":") { colon = i; break; }
-  }
-
-  h = 1 * t.slice(0, colon);
-  m = 1 * t.slice(colon + 1);
+  if (typeof t !== "string") return null;
+  var colon = t.indexOf(":");
+  if (colon < 1) return null;
+  var h = parseInt(t.slice(0, colon), 10);
+  var m = parseInt(t.slice(colon + 1, colon + 3), 10);
+  if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
   return h * 60 + m;
 }
 
@@ -72,9 +67,20 @@ function findActiveWindow(nowMin) {
   for (var i = 0; i < WINDOWS.length; i++) {
     var ws = WINDOWS[i][0] * 60 + WINDOWS[i][1]; // inicio de franja
     var we = WINDOWS[i][2] * 60 + WINDOWS[i][3]; // fin de franja
-    if (nowMin >= ws && nowMin < we) return i;
+    if (ws < we && nowMin >= ws && nowMin < we) return i;
+    if (ws > we && (nowMin >= ws || nowMin < we)) return i; // cruza medianoche
   }
   return -1;
+}
+
+function secondsUntilWindowEnd(windowIndex, nowMin, sys) {
+  var start = WINDOWS[windowIndex][0] * 60 + WINDOWS[windowIndex][1];
+  var end = WINDOWS[windowIndex][2] * 60 + WINDOWS[windowIndex][3];
+  var now = nowMin * 60;
+  if (typeof sys.unixtime === "number" && sys.unixtime > 0) now += sys.unixtime % 60;
+  var endSeconds = end * 60;
+  if (start > end && nowMin >= start) endSeconds += 24 * 3600;
+  return Math.max(0, endSeconds - now);
 }
 
 // Devuelve una duración aleatoria de DURATIONS_MIN, convertida a milisegundos.
@@ -98,6 +104,9 @@ function clearActiveTimer() {
 function onSwitchResult(result, error_code, error_message) {
   if (error_code !== 0) {
     print("PresenceSim ▶ ERROR Switch.Set:", error_message);
+    // Estado físico desconocido; volver a intentar apagar en la siguiente
+    // comprobación, en lugar de asumir que la orden se aplicó.
+    lightsAreOff = false;
   }
 }
 
@@ -160,6 +169,11 @@ function tick() {
   }
 
   var nowMin = timeStrToMin(sys.time);
+  if (nowMin === null) {
+    print("PresenceSim ▶ formato de hora no válido; reintentando en 30 s.");
+    activeTimer = Timer.set(30 * 1000, false, tick);
+    return;
+  }
   var winIdx = findActiveWindow(nowMin);
 
   if (winIdx !== -1) {
@@ -172,8 +186,7 @@ function tick() {
     // MEJORA: antes una luz podía quedar encendida varios minutos después de
     // cerrarse la franja, si el timer expiraba más tarde. Ahora se recorta.
     var dur = randomDurMs();
-    var we = WINDOWS[winIdx][2] * 60 + WINDOWS[winIdx][3];
-    var remainMs = (we - nowMin) * 60 * 1000;
+    var remainMs = secondsUntilWindowEnd(winIdx, nowMin, sys) * 1000;
     if (dur > remainMs) {
       dur = remainMs;
       print("PresenceSim ▶ duración recortada al cierre de franja");

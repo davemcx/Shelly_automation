@@ -1,10 +1,16 @@
+// =============================================================================
 // Secuencia temporizada ON/OFF para Shelly Plus Plug S.
 // Gen2+ con scripting. Conserva las duraciones originales.
+// =============================================================================
 
 // ── Configuración ────────────────────────────────────────────────────────────
 var SWITCH_ID = 0;
 var STOP_FLAG_KEY = "stop_sequence";
 var SEQUENCE = [
+  { state: true,  durationMin: 15 },
+  { state: false, durationMin: 10 },
+  { state: true,  durationMin: 1  },
+  { state: false, durationMin: 10 },
   { state: true,  durationMin: 15 },
   { state: false, durationMin: 10 },
   { state: true,  durationMin: 1  },

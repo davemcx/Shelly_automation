@@ -1,5 +1,7 @@
+// =============================================================================
 // Shelly: secuencia aleatoria diaria para un relé.
 // Toda la actividad queda limitada a la ventana horaria configurada.
+// =============================================================================
 
 // ── Configuración ────────────────────────────────────────────────────────────
 var BASE_INTERVALS = [2, 4, 6, 8, 9, 11, 13, 15]; // minutos ON
